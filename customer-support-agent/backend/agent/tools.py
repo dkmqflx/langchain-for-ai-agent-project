@@ -29,9 +29,14 @@ BM25 인덱스 관리:
   - 문서가 없을 경우: Vector만 사용 (graceful fallback)
 """
 
+from typing import Annotated
+
 from langchain_classic.retrievers.ensemble import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
+from langgraph.prebuilt import InjectedStore
+from langgraph.store.base import BaseStore
 
 from rag.vectorstore import vectorstore
 
@@ -129,3 +134,60 @@ def search_documents(query: str) -> str:
         parts.append(f"[출처: {source}, 페이지: {page}]\n{doc.page_content}")
 
     return "\n\n---\n\n".join(parts)
+
+
+@tool
+def save_user_preference(
+    key: str,
+    value: str,
+    config: RunnableConfig,
+    store: Annotated[BaseStore, InjectedStore()],
+) -> str:
+    """
+    사용자 선호도를 장기 기억에 저장합니다.
+
+    언어 설정, 응답 스타일, 알림 방식 등 고객이 원하는 선호도를 저장할 때 사용하세요.
+    저장된 선호도는 대화가 끊겨도 다음 대화에서 자동으로 반영됩니다.
+
+    Args:
+        key: 선호도 이름 (예: "language", "response_style", "notification")
+        value: 선호도 값 (예: "한국어", "간결하게", "이메일")
+
+    예시:
+        고객: "앞으로는 영어로만 답변해줘"
+        → save_user_preference(key="language", value="English")
+        → 다음 대화부터 자동으로 영어로 답변
+    """
+    # config와 store는 LangGraph가 자동으로 주입 (LLM 호출 스키마에 노출 안 됨)
+    user_id = config["configurable"].get("user_id", "anonymous")
+    namespace = ("user_preferences", user_id)
+
+    # store.put(namespace, key, value_dict) 형식으로 저장
+    # namespace: ("user_preferences", "cust-001") → 사용자별로 격리된 공간
+    # key:       "language"
+    # value:     {"value": "한국어"} → dict 형태로 저장
+    store.put(namespace, key, {"value": value})
+
+    return f"선호도 저장 완료: {key} = {value}"
+
+
+@tool
+def get_user_preferences(
+    config: RunnableConfig,
+    store: Annotated[BaseStore, InjectedStore()],
+) -> str:
+    """
+    저장된 사용자 선호도를 모두 조회합니다.
+
+    현재 고객의 저장된 모든 선호도를 확인할 때 사용하세요.
+    선호도가 없으면 그 사실을 알려줍니다.
+    """
+    user_id = config["configurable"].get("user_id", "anonymous")
+    namespace = ("user_preferences", user_id)
+
+    items = store.search(namespace)
+
+    if not items:
+        return "저장된 선호도가 없습니다."
+
+    return "\n".join(f"{item.key}: {item.value['value']}" for item in items)

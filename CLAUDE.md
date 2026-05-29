@@ -34,7 +34,7 @@ customer-support-agent/
 │   │   ├── splitter.py          # RecursiveCharacterTextSplitter (chunk_size=500, overlap=50)
 │   │   ├── embedder.py          # OpenAIEmbeddings + CacheBackedEmbeddings
 │   │   └── vectorstore.py       # pgvector store/retrieve
-│   └── api/
+│   └── routers/
 │       ├── chat.py              # POST /chat
 │       ├── upload.py            # POST /upload
 │       └── approve.py           # POST /approve, GET /pending (Human-in-the-loop)
@@ -51,8 +51,7 @@ customer-support-agent/
 
 ```bash
 cd customer-support-agent/backend
-pip install -r requirements.txt
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ### Frontend

@@ -28,15 +28,16 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 # .env 파일은 backend의 상위(customer-support-agent/) 디렉토리에 위치
 load_dotenv(Path(__file__).parent.parent / ".env")
 from fastapi.middleware.cors import CORSMiddleware
 
 from agent.tools import build_bm25
-from api.chat import router as chat_router
-from api.upload import router as upload_router
+from routers.chat import router as chat_router
+from routers.upload import router as upload_router
 
 
 @asynccontextmanager
@@ -77,6 +78,20 @@ app.add_middleware(
     allow_methods=["*"],   # GET, POST, PUT, DELETE 등 모두 허용
     allow_headers=["*"],   # 모든 헤더 허용
 )
+
+# 전역 HTTPException 핸들러
+# 모든 HTTPException을 프로젝트 공통 응답 형식으로 변환
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "message": exc.detail,
+            "data": None,
+        }
+    )
+
 
 # 라우터 등록
 # upload_router: POST /upload, GET /documents

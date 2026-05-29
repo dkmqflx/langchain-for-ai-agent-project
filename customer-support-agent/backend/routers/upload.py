@@ -30,10 +30,10 @@ RAG 파이프라인 Step 5: 업로드 API (Upload Endpoint)
 import os
 import tempfile
 
-from fastapi import APIRouter, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, HTTPException, UploadFile
 
 from agent.tools import build_bm25
+from models.upload import DocumentsResponse, UploadResponse
 from rag.loader import load_document
 from rag.splitter import split_documents
 from rag.vectorstore import add_documents, vectorstore
@@ -46,7 +46,7 @@ router = APIRouter()
 ALLOWED_EXTENSIONS = {".pdf", ".txt"}
 
 
-@router.post("/upload")
+@router.post("/upload", response_model=UploadResponse, status_code=201)
 async def upload_document(file: UploadFile):
     """
     파일 업로드 → Step 1~4 자동 실행.
@@ -96,14 +96,7 @@ async def upload_document(file: UploadFile):
     # [1] 파일 확장자 검증
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "success": False,
-                "message": f"Unsupported file type: {ext}. Use PDF or TXT.",
-                "data": None
-            }
-        )
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}. Use PDF or TXT.")
 
     # [2] 임시 파일로 저장하는 이유:
     #
@@ -147,16 +140,10 @@ async def upload_document(file: UploadFile):
             }
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        # [5] 에러 처리: 상세 메시지를 클라이언트에 반환
-        return JSONResponse(
-            status_code=500,
-            content={
-                "success": False,
-                "message": str(e),
-                "data": None
-            }
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
     finally:
         # [6] 임시 파일 정리 (매우 중요)
@@ -174,7 +161,7 @@ async def upload_document(file: UploadFile):
         os.unlink(tmp_path)  # 임시 파일 삭제
 
 
-@router.get("/documents")
+@router.get("/documents", response_model=DocumentsResponse)
 async def list_documents():
     """
     업로드된 문서 목록 조회.
@@ -241,12 +228,4 @@ async def list_documents():
         }
 
     except Exception as e:
-        # 에러 발생 시 에러 응답 반환
-        return JSONResponse(
-            status_code=500,
-            content={
-                "success": False,
-                "message": str(e),
-                "data": None
-            }
-        )
+        raise HTTPException(status_code=500, detail=str(e))
