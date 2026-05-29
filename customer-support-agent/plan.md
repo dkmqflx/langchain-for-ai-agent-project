@@ -272,8 +272,8 @@ ensemble_retriever = EnsembleRetriever(
 | `backend/agent/context.py` | **생성** - Context dataclass (user_id, user_tier) |
 | `backend/agent/tools.py` | **수정** - `save_user_preference`, `get_user_preference` 추가 |
 | `backend/agent/agent.py` | **수정** - InMemorySaver(checkpointer) + InMemoryStore(store) 추가 |
-| `backend/agent/middleware.py` | **생성** - `inject_memory` (Long-term memory → system prompt 주입) |
-| `backend/api/chat.py` | **수정** - config에 user_id 전달 |
+| `backend/agent/middleware.py` | **생성** - `InjectMemoryMiddleware` (Long-term memory → system prompt 주입) |
+| `backend/routers/chat.py` | **수정** - config에 user_id 전달 |
 
 ### 핵심 구현 포인트
 
@@ -284,9 +284,9 @@ checkpointer = InMemorySaver()   # thread_id 기반 대화 이력
 store = InMemoryStore()           # user_id 기반 장기 기억
 ```
 
-**Memory Tools**: `InjectedStore`를 통해 LangGraph Store에 접근. 네임스페이스 `("user_preferences", user_id)`.
+**Memory Tools**: `ToolRuntime[AgentContext]`를 통해 store와 context에 접근. 네임스페이스 `("user_preferences", user_id)`.
 
-**inject_memory**: `create_react_agent`의 `prompt`를 callable로 만들어 장기 메모리를 동적으로 system prompt에 주입.
+**InjectMemoryMiddleware**: `create_agent`의 `middleware=[]`에 등록하는 `AgentMiddleware` 서브클래스. `before_model` 훅에서 장기 메모리를 system prompt에 동적 주입.
 
 ### 검증
 - 같은 thread_id로 대화 → 이전 맥락 기억 확인 (Short-term)
@@ -302,24 +302,32 @@ store = InMemoryStore()           # user_id 기반 장기 기억
 
 | 파일 | 변경 |
 |------|------|
-| `backend/agent/middleware.py` | **수정** - PII 마스킹 + Before/After Guardrail 추가 |
-| `backend/api/chat.py` | **수정** - 미들웨어 파이프라인 통합 |
+| `backend/agent/agent.py` | **수정** - `create_react_agent` → `create_agent`, `PIIMiddleware` + `InjectMemoryMiddleware` 추가 |
+| `backend/agent/middleware.py` | **수정** - `InjectMemoryMiddleware` 클래스 추가, `is_blocked_input`, `check_hallucination` 추가 |
+| `backend/agent/tools.py` | **수정** - `InjectedStore+RunnableConfig` → `ToolRuntime[AgentContext]` |
+| `backend/routers/chat.py` | **수정** - Before/After Guardrail 통합, `context=AgentContext(...)` 방식으로 변경 |
 
 ### 핵심 구현 포인트
 
-**PII Masking (middleware.py)**:
-- 이메일: regex로 탐지 → `[EMAIL REDACTED]`로 치환
-- 카드번호: regex로 탐지 → `****-****-****-1234` (마지막 4자리만 노출)
-- 입력/출력 모두에 적용
+**create_agent 마이그레이션**:
+- `create_react_agent` (langgraph.prebuilt) → `create_agent` (langchain.agents): 공식 표준 에이전트
+- `middleware=[]` 파라미터로 `PIIMiddleware`, `InjectMemoryMiddleware` 연결
+- `context_schema=AgentContext` + `invoke(context=AgentContext(...))` 로 user_id 전달
 
-**Before Agent Guardrail**: 키워드 기반 욕설/부적절 콘텐츠 차단. 탐지 시 에이전트 스킵하고 거절 메시지 반환.
+**PII Masking (PIIMiddleware)**:
+- `langchain.agents.middleware.PIIMiddleware` 공식 내장 미들웨어 사용
+- 이메일: 커스텀 regex detector → `[REDACTED_EMAIL]`
+- 카드번호: 커스텀 regex detector → `****-****-****-1234`
+- `apply_to_input=True, apply_to_output=True`로 에이전트 내부에서 입출력 모두 처리
 
-**After Agent Guardrail**: GPT-4o-mini 감시자 모델로 할루시네이션 검증.
-- 에이전트 응답 + 검색된 컨텍스트를 GPT-4o-mini에게 전달
-- `"HALLUCINATION"` 판정 시 교정된 답변으로 대체
-- 검색 컨텍스트 접근: `search_documents` Tool 결과를 thread 단위 dict에 저장
+**Before Agent Guardrail**: `is_blocked_input()` — 키워드 기반 욕설 차단. 탐지 시 `agent.invoke()` 호출 없이 즉시 거절 반환.
 
-**chat.py 미들웨어 파이프라인**: PII 마스킹(입력) → 욕설 체크 → 에이전트 실행 → 할루시네이션 검증 → PII 마스킹(출력)
+**After Agent Guardrail**: `check_hallucination()` — GPT-4o-mini 감시자 모델로 할루시네이션 검증.
+- `result["messages"]`에서 `ToolMessage(name="search_documents")` 수집
+- 검색 컨텍스트 있을 때만 실행 (없으면 오탐 방지를 위해 생략)
+- `"HALLUCINATION"` 판정 시 교정 메시지로 대체
+
+**chat.py 파이프라인**: 욕설 체크 → 에이전트 실행(내부 PIIMiddleware 자동 실행) → 검색 컨텍스트 추출 → 할루시네이션 검증
 
 ### 검증
 - 이메일/카드번호 포함 메시지 → 마스킹 확인
@@ -338,8 +346,8 @@ store = InMemoryStore()           # user_id 기반 장기 기억
 |------|------|
 | `backend/agent/tools.py` | **수정** - `process_refund` Tool 추가 (interrupt() 사용) |
 | `backend/agent/agent.py` | **수정** - tools 리스트에 process_refund 추가 |
-| `backend/api/approve.py` | **생성** - GET /pending, POST /approve |
-| `backend/api/chat.py` | **수정** - GraphInterrupt 처리, pending_approval 상태 반환 |
+| `backend/routers/approve.py` | **생성** - GET /pending, POST /approve |
+| `backend/routers/chat.py` | **수정** - GraphInterrupt 처리, pending_approval 상태 반환 |
 | `backend/main.py` | **수정** - approve_router 등록 |
 
 ### 핵심 구현 포인트
@@ -449,9 +457,9 @@ def get_agent(req: Request):
 ```
 Phase 1: requirements.txt → rag/{__init__, loader, splitter, embedder, vectorstore}.py → api/{__init__, upload}.py
 Phase 2: agent/{__init__, tools, agent}.py → api/chat.py → main.py
-Phase 3: agent/context.py → tools.py 수정 → agent.py 수정 → agent/middleware.py → chat.py 수정
-Phase 4: middleware.py 수정 → chat.py 수정
-Phase 5: tools.py 수정 → agent.py 수정 → api/approve.py → chat.py 수정 → main.py 수정
+Phase 3: agent/context.py → tools.py 수정 → agent.py 수정 → agent/middleware.py → routers/chat.py 수정
+Phase 4: agent/agent.py 수정(create_agent+PIIMiddleware) → middleware.py 수정(InjectMemoryMiddleware) → tools.py 수정(ToolRuntime) → routers/chat.py 수정
+Phase 5: tools.py 수정 → agent.py 수정 → routers/approve.py → routers/chat.py 수정 → main.py 수정
 Phase 6: frontend/ 초기화 → page.tsx, admin/page.tsx, approve/page.tsx → chat.py 수정
 Phase 7: .gitignore → .github/workflows/deploy.yml → AWS 수동 설정
 ```

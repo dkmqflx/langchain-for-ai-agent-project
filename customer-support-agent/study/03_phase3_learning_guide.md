@@ -44,11 +44,11 @@ Phase 3는 두 가지 기억을 추가합니다:
 
 ```
 [새로 추가된 파일]
-context.py   → 요청마다 user_id 담는 데이터 클래스
-middleware.py → 장기 기억을 system prompt에 주입하는 함수
-tools.py     → save_user_preference, get_user_preferences 도구 추가
-agent.py     → checkpointer(단기) + store(장기) 연결
-chat.py      → config에 user_id 추가
+context.py      → 요청마다 user_id 담는 데이터 클래스
+middleware.py   → 장기 기억을 system prompt에 주입하는 함수
+tools.py        → save_user_preference, get_user_preferences 도구 추가
+agent.py        → checkpointer(단기) + store(장기) 연결
+routers/chat.py → config에 user_id 추가
 
 [요청 흐름]
 POST /chat {"message": "한국어로 답변해줘", "user_id": "cust-001"}
@@ -545,7 +545,7 @@ Phase 5: + process_refund tool
 
 ---
 
-## Step 5: `api/chat.py` 읽기 (10분)
+## Step 5: `routers/chat.py` 읽기 (10분)
 
 ### 목표
 
@@ -724,7 +724,7 @@ Agent가 한국어로 답변 (고객이 다시 요청 안 해도!)
 - prompt를 문자열 → callable로 바꾼 이유 이해
 - Phase 2 → Phase 3 변화 요약 이해
 
-### chat.py
+### routers/chat.py
 - config에 user_id를 추가한 이유 이해
 - thread_id와 user_id가 각각 어느 기억에 사용되는지 이해
 
@@ -754,8 +754,13 @@ Production 전환 (Phase 7):
 
 Phase 3을 완료했으면:
 
-- **Phase 4**: PII + Guardrail Middleware
-  - PII 마스킹: 이메일, 카드번호를 자동으로 가림
-    예) "내 이메일은 test@test.com이에요" → "[EMAIL REDACTED]"
-  - Before Guardrail: 욕설/부적절 메시지 차단
-  - After Guardrail: GPT-4o-mini가 답변 검증 (할루시네이션 방지)
+- **Phase 4**: PII + Guardrail Middleware + `create_agent` 마이그레이션
+  - `create_react_agent` → `create_agent` (LangChain 공식 표준 에이전트)
+    - `middleware=[]` 파라미터 지원 → `PIIMiddleware` 등 공식 미들웨어 사용 가능
+    - `context_schema=AgentContext` → user_id를 `config` 대신 `context=` 로 전달
+    - 도구의 `InjectedStore + RunnableConfig` → `ToolRuntime[AgentContext]`
+    - `make_inject_memory` callable → `InjectMemoryMiddleware` 클래스
+  - PII 마스킹: `PIIMiddleware` (langchain 내장) + 커스텀 detector
+    예) "내 이메일은 test@test.com이에요" → "[REDACTED_EMAIL]"
+  - Before Guardrail: 키워드 기반 욕설 차단 (`is_blocked_input`)
+  - After Guardrail: GPT-4o-mini가 답변 검증 (`check_hallucination`)

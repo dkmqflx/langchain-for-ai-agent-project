@@ -32,7 +32,7 @@ BM25 인덱스 관리:
 from langchain_classic.retrievers.ensemble import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.tools import tool
-from langgraph.prebuilt.tool_node import ToolRuntime
+from langchain.tools import ToolRuntime
 
 from agent.context import AgentContext
 from rag.vectorstore import vectorstore
