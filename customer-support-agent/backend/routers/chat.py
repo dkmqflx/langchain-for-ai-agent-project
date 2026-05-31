@@ -269,8 +269,10 @@ async def chat_stream(request: ChatRequest):
                 }
                 return
 
-            if used_search:
+            if used_search and answer_buffer:
                 # RAG 답변: 검색 컨텍스트로 할루시네이션 검사 후 완성본 전송
+                # answer_buffer가 비어 있으면(검색만 하고 최종 답변 토큰 없음) 검사를 건너뛰고
+                # 아래 done 이벤트로 흘려보냄 (빈 message 방지)
                 combined_context = "\n\n---\n\n".join(search_contexts)
                 answer = "".join(answer_buffer)
                 checked = check_hallucination(answer, combined_context)
