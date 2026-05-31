@@ -46,7 +46,7 @@ After Guardrail (에이전트 실행 후):
 [수정된 파일]
 agent/context.py    → 변경 없음
 agent/tools.py      → InjectedStore+RunnableConfig → ToolRuntime[AgentContext]
-agent/middleware.py → InjectMemoryMiddleware 클래스, is_blocked_input, check_hallucination 추가
+agent/middleware.py → inject_memory (@before_model 함수), is_blocked_input, check_hallucination 추가
 agent/agent.py      → PIIMiddleware + middleware=[] 추가
 routers/chat.py     → Before/After Guardrail 통합, context= 방식으로 변경
 
@@ -56,11 +56,11 @@ POST /chat {"message": "씨발 환불해줘", "user_id": "cust-001", "thread_id"
 [1] is_blocked_input(message)       → 욕설 감지 → 즉시 반환 (에이전트 미실행)
      ↓ (차단 안 됨)
 [2] agent.invoke(
-      context=AgentContext(user_id)  → InjectMemoryMiddleware가 사용 (장기 기억)
+      context=AgentContext(user_id)  → inject_memory가 사용 (장기 기억)
       config={thread_id}             → checkpointer가 사용 (단기 기억)
     )
      ┌─ 에이전트 내부 ─────────────────────────────────────────┐
-     │  InjectMemoryMiddleware.before_model → system prompt 주입  │
+     │  inject_memory (before_model)       → system prompt 주입  │
      │  PIIMiddleware.before_model         → 입력 PII 마스킹      │
      │  ---- 모델 호출 ----                                       │
      │  PIIMiddleware.after_model          → 출력 PII 마스킹      │
@@ -141,64 +141,68 @@ from langchain.tools import ToolRuntime   # ✅ 공식 LangChain API
 
 ---
 
-## Step 2: `agent/middleware.py` 읽기 — InjectMemoryMiddleware (20분)
+## Step 2: `agent/middleware.py` 읽기 — inject_memory (20분)
 
 ### 목표
 
-`make_inject_memory` 팩토리 패턴이 왜 `InjectMemoryMiddleware` 클래스로 바뀌었는지,
-`AgentMiddleware.before_model` 훅이 어떻게 작동하는지 이해
+`@before_model` 데코레이터 패턴이 어떻게 작동하는지,
+클래스 기반이 아닌 함수 기반 미들웨어로 어떻게 정의하는지 이해
 
 ---
 
-### 핵심 개념 1: InjectMemoryMiddleware — AgentMiddleware 방식
+### 핵심 개념 1: inject_memory — @before_model 데코레이터 방식
 
 ```python
 # agent.py
 _agent = create_agent(
     model=_llm,
     tools=[...],
-    system_prompt=SYSTEM_PROMPT,           # ← 정적 문자열
-    middleware=[InjectMemoryMiddleware()], # ← 미들웨어로 동적 주입
+    system_prompt=SYSTEM_PROMPT,  # ← 정적 문자열
+    middleware=[inject_memory],   # ← @before_model 함수를 직접 전달
 )
 
 # middleware.py
-class InjectMemoryMiddleware(AgentMiddleware):
-    def before_model(self, state, runtime: Runtime) -> dict | None:
-        user_id = runtime.context.user_id
-        items = runtime.store.search(("user_preferences", user_id))
-        # SystemMessage 찾아서 선호도 추가
-        ...
-        return {"messages": updated_messages}
+from langchain.agents.middleware import before_model
+
+@before_model
+def inject_memory(state, runtime: Runtime) -> dict | None:
+    user_id = runtime.context.user_id
+    items = runtime.store.search(("user_preferences", user_id))
+    # SystemMessage 찾아서 선호도 추가
+    ...
+    return {"messages": updated_messages}
 ```
 
-`system_prompt=` 파라미터는 정적 문자열을 받고, 동적 주입은 `middleware=`의 `AgentMiddleware`로 처리합니다.
+`system_prompt=` 파라미터는 정적 문자열을 받고, 동적 주입은 `@before_model` 데코레이터 함수로 처리합니다.
 
 ---
 
-### 핵심 개념 2: AgentMiddleware.before_model 훅
+### 핵심 개념 2: @before_model 데코레이터 훅
 
 ```python
-class InjectMemoryMiddleware(AgentMiddleware):
-    def before_model(self, state: Any, runtime: Runtime) -> dict | None:
-        # runtime.store   → InMemoryStore (store= 파라미터로 주입된 것)
-        # runtime.context → AgentContext (context=AgentContext(...) 로 전달된 것)
-        
-        if not runtime.store or not runtime.context:
-            return None  # 변경 없음
-        
-        items = runtime.store.search(("user_preferences", runtime.context.user_id))
-        
-        if not items:
-            return None  # 선호도 없으면 변경 없음
-        
-        # SystemMessage 찾아서 선호도 추가
-        messages = list(state["messages"])
-        for i, msg in enumerate(messages):
-            if isinstance(msg, SystemMessage):
-                messages[i] = SystemMessage(content=msg.content + memory_text)
-                return {"messages": messages}  # 변경된 state 반환
-        
-        return None
+from langchain.agents.middleware import before_model
+
+@before_model
+def inject_memory(state: Any, runtime: Runtime) -> dict | None:
+    # runtime.store   → InMemoryStore (store= 파라미터로 주입된 것)
+    # runtime.context → AgentContext (context=AgentContext(...) 로 전달된 것)
+    
+    if not runtime.store or not runtime.context:
+        return None  # 변경 없음
+    
+    items = runtime.store.search(("user_preferences", runtime.context.user_id))
+    
+    if not items:
+        return None  # 선호도 없으면 변경 없음
+    
+    # SystemMessage 찾아서 선호도 추가
+    messages = list(state["messages"])
+    for i, msg in enumerate(messages):
+        if isinstance(msg, SystemMessage):
+            messages[i] = SystemMessage(content=msg.content + memory_text)
+            return {"messages": messages}  # 변경된 state 반환
+    
+    return None
 ```
 
 **before_model 반환값 의미:**
@@ -254,8 +258,8 @@ def check_hallucination(answer: str, context: str) -> str:
 ### 학습 질문
 
 - `before_model`이 `None`을 반환할 때와 `{"messages": [...]}`를 반환할 때의 차이는?
-- `abefore_model`을 따로 정의하지 않으면 어떻게 될까? (`AgentMiddleware` 기본 구현 확인)
-- Phase 3의 `make_inject_memory`에서는 팩토리 패턴이 필요했는데, Phase 4에서는 왜 필요 없는가?
+- `@before_model` 데코레이터 함수와 클래스 기반 `AgentMiddleware`의 차이는 무엇인가?
+- `@before_model` vs `@after_model` — 각각 어떤 시점에 실행되는가?
 
 ---
 
@@ -277,7 +281,7 @@ _agent = create_agent(
     tools=[...],
     system_prompt=SYSTEM_PROMPT,  # str/SystemMessage
     middleware=[                   # 공식 middleware= 파라미터
-        InjectMemoryMiddleware(),
+        inject_memory,             # @before_model 데코레이터 함수
         PIIMiddleware("email", ...),
         PIIMiddleware("credit_card", ...),
     ],
@@ -352,7 +356,7 @@ create_agent의 context_schema= 로 타입을 선언하면
 
 ### 학습 질문
 
-- `middleware=[]` 리스트의 순서가 중요한가? `PIIMiddleware`가 `InjectMemoryMiddleware`보다 먼저 오면?
+- `middleware=[]` 리스트의 순서가 중요한가? `PIIMiddleware`가 `inject_memory`보다 먼저 오면?
 - `apply_to_input=True, apply_to_output=False`(기본값)이면 출력 PII는 어떻게 되는가?
 - `create_agent`에 `store=_store`를 넘기면 어디서 접근할 수 있는가?
 
@@ -467,7 +471,7 @@ curl -X POST http://localhost:8000/chat \
     "user_id": "cust-003"
   }'
 
-# 6. 새 대화에서 선호도 반영 확인 (InjectMemoryMiddleware)
+# 6. 새 대화에서 선호도 반영 확인 (inject_memory)
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
   -d '{
@@ -475,7 +479,7 @@ curl -X POST http://localhost:8000/chat \
     "thread_id": "ctx-test-2",
     "user_id": "cust-003"
   }'
-# 기대: 영어로 답변 (InjectMemoryMiddleware가 선호도 주입)
+# 기대: 영어로 답변 (inject_memory가 선호도 주입)
 ```
 
 ---

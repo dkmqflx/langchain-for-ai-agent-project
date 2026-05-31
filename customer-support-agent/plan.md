@@ -275,7 +275,7 @@ ensemble_retriever = EnsembleRetriever(
 | `backend/agent/context.py` | **생성** - Context dataclass (user_id, user_tier) |
 | `backend/agent/tools.py` | **수정** - `save_user_preference`, `get_user_preference` 추가 |
 | `backend/agent/agent.py` | **수정** - InMemorySaver(checkpointer) + InMemoryStore(store) 추가 |
-| `backend/agent/middleware.py` | **생성** - `InjectMemoryMiddleware` (Long-term memory → system prompt 주입) |
+| `backend/agent/middleware.py` | **생성** - `inject_memory` (@before_model 데코레이터, Long-term memory → system prompt 주입) |
 | `backend/routers/chat.py` | **수정** - config에 user_id 전달 |
 
 ### 핵심 구현 포인트
@@ -289,7 +289,7 @@ store = InMemoryStore()           # user_id 기반 장기 기억
 
 **Memory Tools**: `ToolRuntime[AgentContext]`를 통해 store와 context에 접근. 네임스페이스 `("user_preferences", user_id)`.
 
-**InjectMemoryMiddleware**: `create_agent`의 `middleware=[]`에 등록하는 `AgentMiddleware` 서브클래스. `before_model` 훅에서 장기 메모리를 system prompt에 동적 주입.
+**inject_memory**: `@before_model` 데코레이터를 사용한 함수. `create_agent`의 `middleware=[]`에 직접 전달. `before_model` 훅에서 장기 메모리를 system prompt에 동적 주입.
 
 ### 검증
 - 같은 thread_id로 대화 → 이전 맥락 기억 확인 (Short-term)
@@ -305,15 +305,15 @@ store = InMemoryStore()           # user_id 기반 장기 기억
 
 | 파일 | 변경 |
 |------|------|
-| `backend/agent/agent.py` | **수정** - `PIIMiddleware` + `InjectMemoryMiddleware` 추가 |
-| `backend/agent/middleware.py` | **수정** - `InjectMemoryMiddleware` 클래스 추가, `is_blocked_input`, `check_hallucination` 추가 |
+| `backend/agent/agent.py` | **수정** - `PIIMiddleware` + `inject_memory` 추가 |
+| `backend/agent/middleware.py` | **수정** - `inject_memory` 함수 추가 (@before_model 데코레이터), `is_blocked_input`, `check_hallucination` 추가 |
 | `backend/agent/tools.py` | **수정** - `InjectedStore+RunnableConfig` → `ToolRuntime[AgentContext]` |
 | `backend/routers/chat.py` | **수정** - Before/After Guardrail 통합, `context=AgentContext(...)` 방식으로 변경 |
 
 ### 핵심 구현 포인트
 
 **create_agent 구성**:
-- `middleware=[]` 파라미터로 `PIIMiddleware`, `InjectMemoryMiddleware` 연결
+- `middleware=[]` 파라미터로 `inject_memory` (@before_model 함수), `PIIMiddleware` 연결
 - `context_schema=AgentContext` + `invoke(context=AgentContext(...))` 로 user_id 전달
 
 **PII Masking (PIIMiddleware)**:
@@ -460,7 +460,7 @@ def get_agent(req: Request):
 Phase 1: requirements.txt → rag/{__init__, loader, splitter, embedder, vectorstore}.py → api/{__init__, upload}.py
 Phase 2: agent/{__init__, tools, agent}.py → api/chat.py → main.py
 Phase 3: agent/context.py → tools.py 수정 → agent.py 수정 → agent/middleware.py → routers/chat.py 수정
-Phase 4: agent/agent.py 수정(create_agent+PIIMiddleware) → middleware.py 수정(InjectMemoryMiddleware) → tools.py 수정(ToolRuntime) → routers/chat.py 수정
+Phase 4: agent/agent.py 수정(create_agent+PIIMiddleware) → middleware.py 수정(inject_memory @before_model) → tools.py 수정(ToolRuntime) → routers/chat.py 수정
 Phase 5: tools.py 수정 → agent.py 수정 → routers/approve.py → routers/chat.py 수정 → main.py 수정
 Phase 6: frontend/ 초기화 → page.tsx, admin/page.tsx, approve/page.tsx → chat.py 수정
 Phase 7: .gitignore → .github/workflows/deploy.yml → AWS 수동 설정

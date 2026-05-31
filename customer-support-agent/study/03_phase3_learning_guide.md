@@ -131,7 +131,7 @@ Phase 2까지는 모든 사용자에게 동일한 system prompt가 전달됩니�
   (선호도 반영 불가)
 ```
 
-Phase 3는 `InjectMemoryMiddleware`로 요청마다 사용자별 선호도를 system prompt에 동적으로 주입합니다.
+Phase 3는 `inject_memory` (@before_model 데코레이터)로 요청마다 사용자별 선호도를 system prompt에 동적으로 주입합니다.
 
 ```
 요청마다 선호도 조회 → 사용자별 다른 prompt:
@@ -142,35 +142,37 @@ Phase 3는 `InjectMemoryMiddleware`로 요청마다 사용자별 선호도를 sy
 
 ---
 
-### 핵심 개념 2: InjectMemoryMiddleware 내부 동작
+### 핵심 개념 2: inject_memory 내부 동작
 
 ```python
-class InjectMemoryMiddleware(AgentMiddleware):
-    def before_model(self, state, runtime: Runtime) -> dict | None:
-        # [1] runtime에서 user_id 추출
-        user_id = runtime.context.user_id
-        
-        # [2] store에서 해당 사용자의 선호도 조회
-        namespace = ("user_preferences", user_id)
-        items = runtime.store.search(namespace)
-        
-        if not items:
-            return None  # 선호도 없으면 변경 없음
-        
-        # [3] 선호도를 문자열로 변환
-        preferences = "\n".join(
-            f"- {item.key}: {item.value['value']}" for item in items
-        )
-        memory_text = f"\n\n[사용자 선호도 - 반드시 반영하세요]\n{preferences}"
-        
-        # [4] 기존 SystemMessage에 선호도 추가
-        messages = list(state["messages"])
-        for i, msg in enumerate(messages):
-            if isinstance(msg, SystemMessage):
-                messages[i] = SystemMessage(content=msg.content + memory_text)
-                return {"messages": messages}
-        
-        return None
+from langchain.agents.middleware import before_model
+
+@before_model
+def inject_memory(state, runtime: Runtime) -> dict | None:
+    # [1] runtime에서 user_id 추출
+    user_id = runtime.context.user_id
+    
+    # [2] store에서 해당 사용자의 선호도 조회
+    namespace = ("user_preferences", user_id)
+    items = runtime.store.search(namespace)
+    
+    if not items:
+        return None  # 선호도 없으면 변경 없음
+    
+    # [3] 선호도를 문자열로 변환
+    preferences = "\n".join(
+        f"- {item.key}: {item.value['value']}" for item in items
+    )
+    memory_text = f"\n\n[사용자 선호도 - 반드시 반영하세요]\n{preferences}"
+    
+    # [4] 기존 SystemMessage에 선호도 추가
+    messages = list(state["messages"])
+    for i, msg in enumerate(messages):
+        if isinstance(msg, SystemMessage):
+            messages[i] = SystemMessage(content=msg.content + memory_text)
+            return {"messages": messages}
+    
+    return None
 ```
 
 **before_model 반환값 의미:**
@@ -455,7 +457,7 @@ Phase 3:
       model=_llm,
       tools=[search_documents, save_user_preference, get_user_preferences],
       system_prompt=SYSTEM_PROMPT,
-      middleware=[InjectMemoryMiddleware()],  # ← 장기 기억 동적 주입
+      middleware=[inject_memory],  # ← 장기 기억 동적 주입 (@before_model 데코레이터 함수)
       checkpointer=_checkpointer,            # ← 단기 기억 추가
       store=_store,                          # ← 장기 기억 추가
       context_schema=AgentContext,
@@ -636,7 +638,7 @@ Agent가 한국어로 답변 (고객이 다시 요청 안 해도!)
 - user_tier 필드가 지금 당장은 안 쓰이는데 왜 있는지 이해
 
 ### middleware.py
-- `InjectMemoryMiddleware.before_model` 훅의 반환값 의미 이해 (None vs dict)
+- `inject_memory` (@before_model 데코레이터) 훅의 반환값 의미 이해 (None vs dict)
 - 기존 SystemMessage에 선호도를 덧붙이는 방식 이해
 - namespace가 `("user_preferences", user_id)` tuple인 이유 이해
 
