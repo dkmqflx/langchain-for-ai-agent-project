@@ -1,103 +1,173 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+import { useRef, useState } from "react";
+import {
+  ChatEvent,
+  confirmChat,
+  streamChat,
+} from "@/lib/chat";
+
+type Role = "user" | "assistant";
+interface Message {
+  role: Role;
+  content: string;
+}
+interface Pending {
+  tool: string;
+  args: Record<string, unknown>;
+}
+
+const USER_ID = "demo-user"; // 학습용 고정 사용자
+
+export default function ChatPage() {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [pending, setPending] = useState<Pending | null>(null);
+  const threadId = useRef<string>(crypto.randomUUID());
+
+  // 마지막 assistant 말풍선의 content에 텍스트를 누적/설정
+  function upsertAssistant(updater: (prev: string) => string) {
+    setMessages((prev) => {
+      const last = prev[prev.length - 1];
+      if (last?.role === "assistant") {
+        const copy = [...prev];
+        copy[copy.length - 1] = { role: "assistant", content: updater(last.content) };
+        return copy;
+      }
+      return [...prev, { role: "assistant", content: updater("") }];
+    });
+  }
+
+  function handleEvent(e: ChatEvent) {
+    switch (e.type) {
+      case "token":
+        upsertAssistant((prev) => prev + e.content);
+        break;
+      case "message":
+        upsertAssistant(() => e.response);
+        break;
+      case "blocked":
+        upsertAssistant(() => `⚠️ ${e.response}`);
+        break;
+      case "confirmation_required":
+        setPending({ tool: e.tool, args: e.args });
+        break;
+      case "error":
+        upsertAssistant(() => `❌ 오류: ${e.detail}`);
+        break;
+      case "done":
+        break;
+    }
+  }
+
+  async function send() {
+    const text = input.trim();
+    if (!text || busy) return;
+    setInput("");
+    setMessages((prev) => [...prev, { role: "user", content: text }]);
+    setBusy(true);
+    try {
+      await streamChat(
+        { message: text, thread_id: threadId.current, user_id: USER_ID },
+        handleEvent,
+      );
+    } catch (err) {
+      upsertAssistant(() => `❌ 연결 오류: ${String(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function decide(decision: "approve" | "reject") {
+    if (!pending) return;
+    setBusy(true);
+    try {
+      const { response } = await confirmChat({
+        thread_id: threadId.current,
+        decision,
+        user_id: USER_ID,
+      });
+      setMessages((prev) => [...prev, { role: "assistant", content: response }]);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: `❌ 오류: ${String(err)}` },
+      ]);
+    } finally {
+      setPending(null);
+      setBusy(false);
+    }
+  }
+
   return (
-    <div className="font-sans grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="font-mono list-inside list-decimal text-sm/6 text-center sm:text-left">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] font-mono font-semibold px-1 py-0.5 rounded">
-              app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
+    <main className="mx-auto flex h-screen max-w-2xl flex-col p-4">
+      <h1 className="mb-4 text-xl font-bold">고객 지원 챗봇</h1>
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+      <div className="flex-1 space-y-3 overflow-y-auto rounded-lg border border-gray-200 p-4">
+        {messages.length === 0 && (
+          <p className="text-sm text-gray-400">메시지를 입력해 대화를 시작하세요.</p>
+        )}
+        {messages.map((m, i) => (
+          <div
+            key={i}
+            className={m.role === "user" ? "flex justify-end" : "flex justify-start"}
           >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
+            <div
+              className={
+                "max-w-[80%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm " +
+                (m.role === "user"
+                  ? "bg-blue-600 text-white"
+                  : "bg-gray-100 text-gray-900")
+              }
+            >
+              {m.content || "…"}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {pending && (
+        <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-4">
+          <p className="mb-2 text-sm font-medium">
+            환불 신청을 접수할까요? ({JSON.stringify(pending.args)})
+          </p>
+          <div className="flex gap-2">
+            <button
+              onClick={() => decide("approve")}
+              disabled={busy}
+              className="rounded-md bg-amber-600 px-3 py-1 text-sm text-white disabled:opacity-50"
+            >
+              확인(접수)
+            </button>
+            <button
+              onClick={() => decide("reject")}
+              disabled={busy}
+              className="rounded-md bg-gray-300 px-3 py-1 text-sm disabled:opacity-50"
+            >
+              취소
+            </button>
+          </div>
         </div>
-      </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
+      )}
+
+      <div className="mt-3 flex gap-2">
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && send()}
+          disabled={busy}
+          placeholder="메시지를 입력하세요"
+          className="flex-1 rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
+        />
+        <button
+          onClick={send}
+          disabled={busy}
+          className="rounded-md bg-blue-600 px-4 py-2 text-sm text-white disabled:opacity-50"
         >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
-    </div>
+          전송
+        </button>
+      </div>
+    </main>
   );
 }
