@@ -340,40 +340,61 @@ store = InMemoryStore()           # user_id 기반 장기 기억
 
 ## Phase 5: Human-in-the-loop (2일)
 
-**목표**: 민감 작업(환불)은 관리자 승인 후 실행
+**목표**: 환불을 "사용자 본인 확인(동기) → 신청 접수 → 관리자 승인(비동기) → 사용자 조회" 흐름으로 처리
+
+> **설계 핵심 — "사람"이 둘이다**: 관리자 승인을 동기 interrupt로 처리하면 사용자가
+> 관리자를 실시간으로 기다려야 해 비현실적이다. 그래서 둘을 분리한다.
+> - **사용자 본인 확인**: LangGraph interrupt/resume (채팅 중 즉시) — "정말 신청할까요?"
+> - **관리자 승인**: 별도 저장소(refund_store) + 관리자 엔드포인트 (비동기, LangGraph 무관)
+>
+> 또한 "환불 신청 접수"는 위험 작업이 아니라 레코드 생성일 뿐이다. 실제 환불 여부는 관리자가 결정한다.
 
 ### 생성/수정할 파일
 
 | 파일 | 변경 |
 |------|------|
-| `backend/agent/tools.py` | **수정** - `process_refund` Tool 추가 (interrupt() 사용) |
-| `backend/agent/agent.py` | **수정** - tools 리스트에 process_refund 추가 |
-| `backend/routers/approve.py` | **생성** - GET /pending, POST /approve |
-| `backend/routers/chat.py` | **수정** - GraphInterrupt 처리, pending_approval 상태 반환 |
-| `backend/main.py` | **수정** - approve_router 등록 |
+| `backend/agent/refund_store.py` | **생성** - 환불 신청 레코드 저장소 (create/list_pending/list_by_user/get/set_decision) |
+| `backend/agent/tools.py` | **수정** - `submit_refund_request` Tool (신청 접수 = 레코드 생성, ToolRuntime로 user_id) |
+| `backend/agent/middleware.py` | **수정** - SYSTEM_PROMPT에 환불 신청 안내 (본인 확인 후 접수) |
+| `backend/agent/agent.py` | **수정** - tools에 submit_refund_request + `HumanInTheLoopMiddleware`(본인 확인) |
+| `backend/models/refund.py` | **생성** - AdminDecisionRequest / RefundItem |
+| `backend/models/chat.py` | **수정** - ConfirmRequest 추가 |
+| `backend/routers/refund.py` | **생성** - GET /pending, POST /approve(관리자), GET /refunds(사용자) |
+| `backend/routers/chat.py` | **수정** - `__interrupt__` 감지 → confirmation_required + POST /chat/confirm |
+| `backend/main.py` | **수정** - refund_router 등록 |
 
 ### 핵심 구현 포인트
 
-**process_refund Tool**: LangGraph `interrupt()` 직접 사용. interrupt payload에 order_id, amount, reason 포함. 승인 시 `Command(resume=...)` 로 재개.
+**HumanInTheLoopMiddleware = 사용자 본인 확인**: `interrupt()`를 도구 안에 직접 쓰지 않고 미들웨어가 선언적으로 제어. `submit_refund_request` 실행 직전에 일시정지해 **사용자 본인**의 확인을 받는다 (관리자 아님 — 사용자는 채팅창 앞에 있으니 즉시 재개).
 
 ```python
+# agent.py
+middleware=[
+    inject_memory,
+    HumanInTheLoopMiddleware(
+        interrupt_on={"submit_refund_request": {"allowed_decisions": ["approve", "reject"]}},
+    ),
+    PIIMiddleware(...),
+]
+
+# tools.py — 신청 '접수'만 (실제 환불 아님). 승인 시 레코드 생성
 @tool
-def process_refund(order_id: str, amount: float, reason: str) -> str:
-    approval = interrupt({"type": "refund_approval", "order_id": order_id, ...})
-    if approval.get("decision") == "approve":
-        return f"Refund processed for order {order_id}"
-    else:
-        return f"Refund rejected for order {order_id}"
+def submit_refund_request(order_id, amount, reason, runtime: ToolRuntime[AgentContext]) -> str:
+    req = create_request(user_id=runtime.context.user_id, order_id=order_id, amount=amount, reason=reason)
+    return f"환불 신청이 접수되었습니다. 신청번호: {req.id} ..."
 ```
 
-**GraphInterrupt 처리 (chat.py)**: `ainvoke()` 후 state를 확인하여 interrupt 발생 여부 판단. interrupt 시 `pending_approvals` dict에 저장하고 `status: "pending_approval"` 반환.
+**본인 확인 흐름 (chat.py)**: `result.get("__interrupt__")`로 일시정지 감지 (반드시 `result["messages"][-1]` 접근 **전에** 분기 — interrupt 시 마지막 메시지는 빈 AIMessage). `action_requests[0]["args"]`에서 order_id/amount/reason 추출 → `status: "confirmation_required"` 반환. **관리자 큐에 저장하지 않는다** (interrupt 상태는 checkpointer가 thread_id로 보관). 사용자가 `POST /chat/confirm {thread_id, decision, user_id}` → `Command(resume={"decisions": [{"type": decision}]})`로 재개 (approve=도구 실행→레코드 생성, reject=건너뜀).
 
-**approve.py**: POST /approve에서 `Command(resume={"decision": ...})` 로 에이전트 재개.
+**관리자 승인 흐름 (refund.py)**: LangGraph 재개가 아니라 refund_store CRUD. `GET /pending`(pending 레코드), `POST /approve {refund_id, decision}`(status 변경 — thread_id 아닌 refund_id로 식별), `GET /refunds?user_id`(사용자 마이페이지 조회).
 
 ### 검증
-- "주문 ORD-123 환불 요청" → `pending_approval` 상태 확인
-- GET /pending → 대기 목록에 표시 확인
-- POST /approve → 에이전트 재개 후 처리 완료 확인
+- "ORD-123 환불 요청" → `confirmation_required` 확인 (아직 레코드 없음)
+- `POST /chat/confirm {decision: approve}` → `submitted`, refund_store에 pending 레코드 생성
+- `GET /pending` → 대기 목록에 표시
+- `POST /approve {refund_id, decision: approve}` → status=approved
+- `GET /refunds?user_id` → 사용자가 결과 확인
+- `POST /chat/confirm {decision: reject}` → 레코드 미생성 확인
 
 ---
 
@@ -461,7 +482,7 @@ Phase 1: requirements.txt → rag/{__init__, loader, splitter, embedder, vectors
 Phase 2: agent/{__init__, tools, agent}.py → api/chat.py → main.py
 Phase 3: agent/context.py → tools.py 수정 → agent.py 수정 → agent/middleware.py → routers/chat.py 수정
 Phase 4: agent/agent.py 수정(create_agent+PIIMiddleware) → middleware.py 수정(inject_memory @wrap_model_call) → tools.py 수정(ToolRuntime) → routers/chat.py 수정
-Phase 5: tools.py 수정 → agent.py 수정 → routers/approve.py → routers/chat.py 수정 → main.py 수정
+Phase 5: refund_store.py → tools.py 수정(submit_refund_request) → middleware.py 수정(프롬프트) → agent.py 수정(HITL=본인확인) → models/refund.py + models/chat.py(ConfirmRequest) → routers/refund.py → routers/chat.py 수정(confirmation_required + /chat/confirm) → main.py 수정
 Phase 6: frontend/ 초기화 → page.tsx, admin/page.tsx, approve/page.tsx → chat.py 수정
 Phase 7: .gitignore → .github/workflows/deploy.yml → AWS 수동 설정
 ```
