@@ -588,7 +588,7 @@ token:   prev + e.content → 말풍선이 타이핑되는 것처럼 글자 추�
 message: () => e.response → 말풍선 전체를 새 내용으로 덮어씀 (RAG 완성본)
 ```
 
-RAG 답변의 경우, 스트리밍 중에는 `token` 이벤트가 오지 않다가 `message` 이벤트가 한 번만 옵니다. 빈 말풍선(`"…"`)이 잠시 표시되다가 완성본이 나타납니다.
+RAG 답변의 경우, 스트리밍 중에는 `token` 이벤트가 오지 않고 `message` 이벤트가 한 번만 옵니다. `message` 이벤트가 도착하는 순간 assistant 말풍선이 완성본으로 바로 나타납니다 (`upsertAssistant(() => e.response)`). 일반 답변과 달리 말풍선이 타이핑되는 중간 단계가 없습니다.
 
 ---
 
@@ -706,7 +706,7 @@ curl -N -X POST http://localhost:8000/chat/stream \
   -d '{"message":"씨발 환불해줘","thread_id":"t2","user_id":"u1"}'
 # 기대: event:blocked 1개
 # event: blocked
-# data: {"response": "부적절한 내용이 감지되었습니다...", "thread_id": "t2"}
+# data: {"response": "부적절한 언어가 포함되어 있어 처리할 수 없습니다. 다시 문의해 주세요.", "thread_id": "t2"}
 
 # === 환불 흐름 ===
 
@@ -746,7 +746,7 @@ npm run dev
 # - 일반 질문 → 글자가 실시간으로 흘러나옴
 # - 욕설 → ⚠️ 차단 메시지
 # - 환불 요청 → 확인 카드(노란 박스) → [확인(접수)] 누르면 신청 완료
-# - 문서 질문 → 잠깐 "…" 후 완성본이 한 번에 표시
+# - 문서 질문 → 완성본이 한 번에 바로 표시 (token 없이 message 이벤트 1회)
 ```
 
 ---
