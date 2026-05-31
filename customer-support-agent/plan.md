@@ -179,11 +179,13 @@ POST /upload (PDF 파일)
 
 ```
 fastapi, uvicorn, python-dotenv, python-multipart
-langchain, langchain-openai, langchain-community, langchain-postgres, langgraph
+langchain, langchain-openai, langchain-postgres, langgraph
 pdfplumber, pymupdf, rank-bm25
 psycopg[binary], sqlalchemy
 sse-starlette, langsmith
 ```
+
+> **참고**: `langchain-community`는 deprecated(sunset)되어 제거. `BM25Retriever`는 `rank_bm25`를 직접 사용하는 `rag/bm25.py`에 구현.
 
 ### 전체 데이터 흐름 요약
 
@@ -228,6 +230,7 @@ SELECT cmetadata FROM langchain_pg_embedding LIMIT 3;
 | 파일 | 역할 |
 |------|------|
 | `backend/agent/__init__.py` | 패키지 초기화 |
+| `backend/rag/bm25.py` | **생성** - `BM25Retriever` (rank_bm25 + langchain_core.BaseRetriever 직접 구현) |
 | `backend/agent/tools.py` | `search_documents` Tool (Hybrid Search) |
 | `backend/agent/agent.py` | `create_agent` 설정 |
 | `backend/api/chat.py` | POST /chat 엔드포인트 |
@@ -238,8 +241,8 @@ SELECT cmetadata FROM langchain_pg_embedding LIMIT 3;
 **Hybrid Search (tools.py)**: `EnsembleRetriever` 사용 (내부적으로 RRF 알고리즘 적용)
 
 ```python
-from langchain.retrievers import EnsembleRetriever
-from langchain_community.retrievers import BM25Retriever
+from langchain_classic.retrievers.ensemble import EnsembleRetriever
+from rag.bm25 import BM25Retriever  # rank_bm25 직접 구현 (langchain-community deprecated)
 
 bm25_retriever = BM25Retriever.from_documents(all_docs, k=5)
 vector_retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={"k": 5})

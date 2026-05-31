@@ -179,6 +179,25 @@ BM25는 검색 전에 미리 준비가 필요합니다.
   BM25 인덱스:   미리 만들어둔 카드 목록에서 찾기 (빠름)
 ```
 
+**BM25Retriever 출처:**
+
+`BM25Retriever`는 `rag/bm25.py`에 직접 구현되어 있습니다.
+
+```python
+# rag/bm25.py — langchain-community(deprecated) 대신 직접 구현
+from langchain_core.retrievers import BaseRetriever  # 공식 추상 기반 클래스
+from rank_bm25 import BM25Okapi                       # 알고리즘 라이브러리 (직접 의존성)
+
+class BM25Retriever(BaseRetriever):
+    """BM25 keyword retriever backed by rank-bm25."""
+    ...
+    @classmethod
+    def from_documents(cls, documents, *, k=4, ...) -> BM25Retriever: ...
+```
+
+`langchain-community`는 sunset(deprecated)되었으므로 제거하고,
+`rank_bm25`를 직접 사용하는 방식이 공식 문서 기준에 부합합니다.
+
 **build_bm25() 코드 설명:**
 
 ```python
@@ -240,7 +259,12 @@ _bm25_retriever = BM25Retriever.from_documents(docs, k=5)  # 메모리로 인덱
 
 ### 핵심 개념 5: EnsembleRetriever 설정
 
+`EnsembleRetriever`는 `langchain_classic.retrievers.ensemble`에서 임포트합니다.
+(`langchain_classic`은 공식 패키지이며 DeprecationWarning 없이 사용 가능)
+
 ```python
+from langchain_classic.retrievers.ensemble import EnsembleRetriever
+
 return EnsembleRetriever(
     retrievers=[_bm25_retriever, vector_retriever],
     weights=[0.4, 0.6],  # BM25 40%, Vector 60%
