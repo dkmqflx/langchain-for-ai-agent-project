@@ -37,6 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from agent.tools import build_bm25
 from routers.chat import router as chat_router
+from routers.refund import router as refund_router
 from routers.upload import router as upload_router
 
 
@@ -95,9 +96,11 @@ async def http_exception_handler(request, exc: HTTPException):
 
 # 라우터 등록
 # upload_router: POST /upload, GET /documents
-# chat_router:   POST /chat
+# chat_router:   POST /chat, POST /chat/confirm (사용자 본인 확인)
+# refund_router: GET /pending, POST /approve (관리자 승인), GET /refunds (사용자 조회)
 app.include_router(upload_router)
 app.include_router(chat_router)
+app.include_router(refund_router)
 
 
 @app.get("/health")

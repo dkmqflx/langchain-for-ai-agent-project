@@ -1,24 +1,36 @@
 """
 미들웨어 실행 순서 (에이전트 내부):
-  inject_memory: wrap_model_call 훅 — 모델 호출을 감싸 system_prompt에 선호도 주입
-  PIIMiddleware: before_model(입력 마스킹) / after_model(출력 마스킹) 훅
+  inject_memory:            wrap_model_call 훅 — 모델 호출을 감싸 system_prompt에 선호도 주입
+  HumanInTheLoopMiddleware: after_model 훅 — 모델이 submit_refund_request 도구 호출을 내면
+                            실행 직전에 interrupt()로 일시정지 (사용자 본인 확인 대기)
+  PIIMiddleware:            before_model(입력 마스킹) / after_model(출력 마스킹) 훅
     before_model 순서: PIIMiddleware(email) → PIIMiddleware(card)
     after_model 순서:  PIIMiddleware(card) → PIIMiddleware(email)
 
 PIIMiddleware 커스텀 detector 사유:
   기본 detector는 한국어 앞뒤 이메일과 하이픈 카드번호를 탐지 못함.
   커스텀 regex detector로 두 한계를 모두 해결.
+
+Human-in-the-loop (사용자 본인 확인):
+  HumanInTheLoopMiddleware는 checkpointer + thread_id가 필수 (둘 다 이미 구성됨).
+  submit_refund_request 호출 시 interrupt 발동 → chat.py가 감지 → 사용자가 /chat/confirm으로
+  확인/취소 → Command(resume)로 재개. (관리자 승인은 별도 refund 라우터에서 비동기 처리)
 """
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import PIIMiddleware
+from langchain.agents.middleware import HumanInTheLoopMiddleware, PIIMiddleware
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.store.memory import InMemoryStore
 
 from agent.context import AgentContext
 from agent.middleware import SYSTEM_PROMPT, inject_memory
-from agent.tools import get_user_preferences, save_user_preference, search_documents
+from agent.tools import (
+    get_user_preferences,
+    save_user_preference,
+    search_documents,
+    submit_refund_request,
+)
 
 _llm = ChatOpenAI(
     model="gpt-4o",
@@ -31,10 +43,15 @@ _store = InMemoryStore()
 
 _agent = create_agent(
     model=_llm,
-    tools=[search_documents, save_user_preference, get_user_preferences],
+    tools=[search_documents, save_user_preference, get_user_preferences, submit_refund_request],
     system_prompt=SYSTEM_PROMPT,
     middleware=[
         inject_memory,
+        HumanInTheLoopMiddleware(
+            interrupt_on={
+                "submit_refund_request": {"allowed_decisions": ["approve", "reject"]},
+            },
+        ),
         PIIMiddleware(
             "email",
             detector=r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",

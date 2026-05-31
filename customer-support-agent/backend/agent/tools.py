@@ -51,6 +51,7 @@ from langchain_core.tools import tool
 from langchain.tools import ToolRuntime
 
 from agent.context import AgentContext
+from agent.refund_store import create_request
 from rag.bm25 import BM25Retriever
 from rag.vectorstore import vectorstore
 
@@ -203,3 +204,36 @@ def get_user_preferences(runtime: ToolRuntime[AgentContext]) -> str:
         return "저장된 선호도가 없습니다."
 
     return "\n".join(f"{item.key}: {item.value['value']}" for item in items)
+
+
+@tool
+def submit_refund_request(
+    order_id: str,
+    amount: float,
+    reason: str,
+    runtime: ToolRuntime[AgentContext],
+) -> str:
+    """
+    고객의 환불·결제 취소 '신청'을 접수합니다.
+
+    환불, 결제 취소 등 금전이 오가는 작업에 사용하세요.
+    이 도구는 실제 환불을 즉시 실행하지 않고, 환불 '신청'을 접수만 합니다 (status=pending).
+    HumanInTheLoopMiddleware가 이 도구 실행 직전에 일시정지시켜 고객 본인의 확인을 받고,
+    고객이 확인하면 이 함수가 실행되어 신청 레코드가 생성됩니다.
+    실제 환불 여부는 이후 관리자가 비동기로 승인/거절합니다.
+
+    Args:
+        order_id: 환불 대상 주문번호 (예: "ORD-123")
+        amount: 환불 금액 (원 단위, 예: 50000)
+        reason: 환불 사유 (예: "제품 불량", "단순 변심")
+        runtime: ToolRuntime[AgentContext] — user_id 추출용 (자동 주입)
+
+    Returns:
+        신청 접수 결과 메시지 (신청번호 포함)
+    """
+    user_id = runtime.context.user_id if runtime.context else "anonymous"
+    req = create_request(user_id=user_id, order_id=order_id, amount=amount, reason=reason)
+    return (
+        f"환불 신청이 접수되었습니다. 신청번호: {req.id}, 주문번호: {order_id}, "
+        f"금액: {amount:,.0f}원. 관리자 검토 후 결과를 알려드리겠습니다."
+    )
