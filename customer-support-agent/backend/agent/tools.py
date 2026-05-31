@@ -27,6 +27,23 @@ BM25 인덱스 관리:
   - 앱 시작 시: pgvector 전체 문서 로드 → BM25 인덱스 빌드
   - 새 문서 업로드 시: rebuild_bm25() 호출 → 인덱스 재빌드
   - 문서가 없을 경우: Vector만 사용 (graceful fallback)
+
+제네릭 타입 어노테이션 (ToolRuntime[AgentContext]):
+  - ToolRuntime은 LangChain이 제공하는 제네릭 클래스 (Generic[T])
+    class ToolRuntime(Generic[T]):
+        context: T           # T는 어떤 타입이든 가능
+        store: InMemoryStore
+
+  - [AgentContext]는 우리가 제네릭 파라미터를 구체화한 것
+    ToolRuntime[AgentContext] = "context를 AgentContext 타입으로 지정"
+    마치 List[str], Dict[str, int]처럼 generic을 구체화하는 것과 동일
+
+  - Python은 TypeScript와 달리 제네릭을 <> 대신 [] 문법 사용
+    (Python은 <, >를 이미 비교 연산자로 사용 중이라 불가능)
+
+  - 효과: IDE 자동완성 + 타입 체크
+    runtime: ToolRuntime[AgentContext]
+    → runtime.context.user_id 등이 IDE에서 인식됨 (AgentContext의 속성을 알 수 있음)
 """
 
 from langchain_classic.retrievers.ensemble import EnsembleRetriever
@@ -148,6 +165,10 @@ def save_user_preference(
     Args:
         key: 선호도 이름 (예: "language", "response_style", "notification")
         value: 선호도 값 (예: "한국어", "간결하게", "이메일")
+        runtime: ToolRuntime[AgentContext]
+                 - create_agent에서 자동 주입됨 (수동으로 전달 X)
+                 - runtime.context: AgentContext 타입 (user_id, user_tier 접근 가능)
+                 - runtime.store: InMemoryStore (선호도 저장소)
 
     예시:
         고객: "앞으로는 영어로만 답변해줘"
@@ -167,6 +188,12 @@ def get_user_preferences(runtime: ToolRuntime[AgentContext]) -> str:
 
     현재 고객의 저장된 모든 선호도를 확인할 때 사용하세요.
     선호도가 없으면 그 사실을 알려줍니다.
+
+    Args:
+        runtime: ToolRuntime[AgentContext]
+                 - create_agent에서 자동 주입됨 (수동으로 전달 X)
+                 - runtime.context: AgentContext 타입 (user_id, user_tier 접근 가능)
+                 - runtime.store: InMemoryStore (선호도 저장소)
     """
     user_id = runtime.context.user_id if runtime.context else "anonymous"
     namespace = ("user_preferences", user_id)
