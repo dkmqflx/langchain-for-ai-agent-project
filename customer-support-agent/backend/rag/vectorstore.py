@@ -77,8 +77,11 @@ def _get_connection_string() -> str:
 
 # [모듈 레벨 싱글톤] PGVector 인스턴스
 # 이것을 통해 모든 벡터 저장/검색이 일어남
+#
+# 중요: embeddings=get_cached_embedder()를 여기서 주입하면,
+# 나중에 add_documents()를 호출할 때 임베딩이 자동으로 됨
 vectorstore = PGVector(
-    embeddings=get_cached_embedder(),  # Step 3에서 준비한 임베더
+    embeddings=get_cached_embedder(),  # Step 3에서 준비한 임베더 (자동 임베딩에 사용됨)
     collection_name="documents",  # 컬렉션 이름 (테이블 접두사)
     connection=_get_connection_string(),  # PostgreSQL 연결 문자열
     use_jsonb=True,  # 메타데이터를 JSONB로 저장 (필터링 가능)
@@ -89,8 +92,15 @@ def add_documents(documents: list[Document]) -> list[str]:
     """
     Document 리스트를 pgvector에 저장.
 
-    각 Document의 page_content를 임베딩한 후,
-    벡터 + 텍스트 + 메타데이터를 PostgreSQL에 INSERT합니다.
+    이 함수는 LangChain PGVector의 .add_documents() 메서드를 호출합니다.
+
+    **자동 임베딩 메커니즘:**
+      - vectorstore 객체는 이미 임베더를 알고 있음 (line 80-85에서 주입됨)
+      - 따라서 add_documents()를 호출하면 LangChain이 자동으로:
+        1. 각 Document의 page_content를 OpenAI 임베딩으로 변환
+        2. 1536차원 벡터 생성
+        3. 벡터 + 원본 텍스트 + 메타데이터를 PostgreSQL INSERT
+        4. 저장된 각 벡터의 UUID 리스트 반환
 
     Args:
         documents: splitter.py에서 반환한 청크 Document 리스트
