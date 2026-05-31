@@ -116,6 +116,22 @@ PDF/TXT upload
 - **Memory**: Short-term via `InMemorySaver` (keyed by `thread_id`); Long-term via `InMemoryStore`/Redis injected into system prompt by `inject_memory` middleware
 - **PII handling**: Server-side middleware only — client-side filtering is bypassable
 
+## Coding Standard: Official Documentation Only
+
+**All code must be written strictly according to the official documentation of each library/framework used in this project.**
+
+- LangChain: https://python.langchain.com/docs/
+- LangGraph: https://langchain-ai.github.io/langgraph/
+- LangChain OpenAI: https://python.langchain.com/docs/integrations/providers/openai/
+- FastAPI: https://fastapi.tiangolo.com/
+- pgvector / langchain-postgres: https://github.com/langchain-ai/langchain-postgres
+
+Rules:
+- Do not use deprecated packages or deprecated APIs. Validate with `python -W error::DeprecationWarning -c "from X import Y"` before committing.
+- `langchain-community` is sunset — do **not** import from it. Use standalone integration packages or `langchain_core` equivalents.
+- `langchain_classic` re-exports are acceptable only when they pass the deprecation warning test (no `DeprecationWarning` emitted on import).
+- Every import must be verified as actually importable in the project venv before it is added to the codebase.
+
 ## Implementation Phases
 
 1. **Phase 1** — RAG pipeline (pgvector store/retrieve + `/upload` API)

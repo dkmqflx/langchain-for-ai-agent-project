@@ -7,7 +7,6 @@ python-multipart>=0.0.9
 # LangChain + LangGraph
 langchain>=0.3.0
 langchain-openai>=0.2.0
-langchain-community>=0.3.0
 langchain-postgres>=0.0.12
 langgraph>=0.2.50
 

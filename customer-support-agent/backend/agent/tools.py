@@ -30,11 +30,11 @@ BM25 인덱스 관리:
 """
 
 from langchain_classic.retrievers.ensemble import EnsembleRetriever
-from langchain_community.retrievers import BM25Retriever
 from langchain_core.tools import tool
 from langchain.tools import ToolRuntime
 
 from agent.context import AgentContext
+from rag.bm25 import BM25Retriever
 from rag.vectorstore import vectorstore
 
 # [모듈 레벨 상태] BM25 인덱스 (None이면 아직 빌드 안 됨)
