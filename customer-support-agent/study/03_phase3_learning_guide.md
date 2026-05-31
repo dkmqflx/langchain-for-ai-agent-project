@@ -53,13 +53,13 @@ routers/chat.py → config에 user_id 추가
 [요청 흐름]
 POST /chat {"message": "한국어로 답변해줘", "user_id": "cust-001"}
      ↓
-chat.py → config = {"thread_id": ..., "user_id": "cust-001"}
+chat.py → config={"configurable": {"thread_id": ...}} + context=AgentContext(user_id="cust-001")
      ↓
 agent.py → inject_memory 호출
      ↓
 middleware.py → store에서 "cust-001" 선호도 조회 → system prompt에 추가
      ↓
-ReAct Agent → "save_user_preference('language', '한국어')" 도구 호출
+Agent → "save_user_preference('language', '한국어')" 도구 호출
      ↓
 tools.py → store.put(("user_preferences", "cust-001"), "language", {"value": "한국어"})
      ↓
@@ -115,7 +115,7 @@ class AgentContext:
 
 ### 목표
 
-장기 기억이 system prompt에 어떻게 주입되는지, 팩토리 패턴이 왜 필요한지 이해
+장기 기억이 system prompt에 어떻게 주입되는지, `@wrap_model_call` 미들웨어가 어떻게 동작하는지 이해
 
 ---
 
@@ -224,20 +224,24 @@ LangGraph Store는 계층적 네임스페이스 지원.
 
 ### 목표
 
-InjectedStore가 무엇인지, 왜 config와 store가 LLM에 보이지 않는지 이해
+ToolRuntime이 무엇인지, 왜 runtime이 LLM에 보이지 않는지 이해
 
 ---
 
-### 핵심 개념 1: InjectedStore — LangGraph가 자동 주입하는 파라미터
+### 핵심 개념 1: ToolRuntime — LangChain이 자동 주입하는 파라미터
 
 ```python
+from langchain.tools import ToolRuntime
+
 @tool
 def save_user_preference(
-    key: str,                                   # ← LLM이 채워야 하는 파라미터
-    value: str,                                 # ← LLM이 채워야 하는 파라미터
-    config: RunnableConfig,                     # ← LangGraph가 자동 주입
-    store: Annotated[BaseStore, InjectedStore()], # ← LangGraph가 자동 주입
+    key: str,                          # ← LLM이 채워야 하는 파라미터
+    value: str,                        # ← LLM이 채워야 하는 파라미터
+    runtime: ToolRuntime[AgentContext], # ← LangChain이 자동 주입 (context + store 통합)
 ) -> str:
+    user_id = runtime.context.user_id if runtime.context else "anonymous"
+    namespace = ("user_preferences", user_id)
+    runtime.store.put(namespace, key, {"value": value})
 ```
 
 **비유: 식당 주문서 vs 주방 자동 공급**
@@ -247,13 +251,13 @@ LLM(손님)이 보는 주문서:
   - 선호도 이름(key): ____
   - 선호도 값(value): ____
 
-LLM은 key와 value만 채움. config와 store는 주문서에 없음.
+LLM은 key와 value만 채움. runtime은 주문서에 없음.
 
-주방(LangGraph)이 알아서:
-  - config: 현재 실행 설정 (thread_id, user_id 등)
-  - store: InMemoryStore 인스턴스
+주방(LangChain)이 알아서 runtime을 주입:
+  - runtime.context: AgentContext (user_id, user_tier)
+  - runtime.store:   InMemoryStore 인스턴스
 
-LLM이 채운 값 + LangGraph가 주입한 값 → 함수 실행
+LLM이 채운 값 + LangChain이 주입한 runtime → 함수 실행
 ```
 
 **만약 store를 일반 파라미터로 만들면:**
@@ -271,6 +275,7 @@ def save_user_preference(key: str, value: str, store: BaseStore) -> str:
 #   "store": ???   ← LLM이 어떻게 채우지?? InMemoryStore를 JSON으로 못 표현
 # }
 # → LLM이 store를 채울 수 없음 ❌
+# ToolRuntime은 LangChain이 "주입 파라미터"로 인식해 LLM 스키마에서 제외 ✅
 ```
 
 ---
@@ -279,7 +284,7 @@ def save_user_preference(key: str, value: str, store: BaseStore) -> str:
 
 ```python
 namespace = ("user_preferences", user_id)
-store.put(namespace, key, {"value": value})
+runtime.store.put(namespace, key, {"value": value})
 ```
 
 **비유: 아파트 우편함**
@@ -308,29 +313,26 @@ LangGraph Store는 계층적 네임스페이스 지원.
 
 ---
 
-### 핵심 개념 3: get_user_preferences — 파라미터 없는 도구
+### 핵심 개념 3: get_user_preferences — LLM 노출 파라미터 없는 도구
 
 ```python
 @tool
-def get_user_preferences(
-    config: RunnableConfig,                     # ← 자동 주입
-    store: Annotated[BaseStore, InjectedStore()], # ← 자동 주입
-) -> str:
+def get_user_preferences(runtime: ToolRuntime[AgentContext]) -> str:
     """저장된 사용자 선호도를 모두 조회합니다."""
 ```
 
-LLM에 노출되는 파라미터가 없습니다. LLM은 인자 없이 호출:
+LLM에 노출되는 파라미터가 없습니다 (runtime은 주입 전용). LLM은 인자 없이 호출:
 
 ```
 LLM: get_user_preferences() 호출
-LangGraph: config와 store를 자동으로 주입 후 실행
+LangChain: runtime(context + store)을 자동으로 주입 후 실행
 ```
 
 ---
 
 ### 학습 질문
 
-- `Annotated[BaseStore, InjectedStore()]`에서 `Annotated`의 역할은 무엇일까?
+- `ToolRuntime[AgentContext]`가 LLM 스키마에 노출되지 않는 이유는 무엇일까?
 - store.put(namespace, "language", {"value": "한국어"})에서 값을 `"한국어"` 대신 `{"value": "한국어"}`로 감싸는 이유는?
 - save_user_preference를 두 번 호출하면 (같은 key) 덮어쓰기가 될까?
 
@@ -491,7 +493,7 @@ Phase 5: + process_refund tool
 
 - `_checkpointer = InMemorySaver()`를 `get_agent()` 내부에서 만들면 어떻게 될까?
 - thread_id와 user_id의 차이를 한 문장으로 설명하면?
-- `make_inject_memory(_store)` 대신 `make_inject_memory(InMemoryStore())`를 넘기면?
+- `store=_store`를 빼면 `inject_memory`와 `save_user_preference`는 어떻게 될까?
 
 ---
 
@@ -499,47 +501,40 @@ Phase 5: + process_refund tool
 
 ### 목표
 
-config에 user_id를 추가하는 이유, thread_id와 user_id가 각각 어디에 쓰이는지 이해
+thread_id는 config로, user_id는 context로 전달하는 이유와 각각 어디에 쓰이는지 이해
 
 ---
 
-### 핵심 개념: config — 두 가지 기억을 연결하는 라우터
+### 핵심 개념: config vs context — 두 가지 기억을 연결하는 라우터
 
 ```python
-config = {
-    "configurable": {
-        "thread_id": request.thread_id,   # → checkpointer가 사용 (단기 기억)
-        "user_id": request.user_id,       # → inject_memory + tools가 사용 (장기 기억)
-    }
-}
-
-result = await agent.invoke(
+result = await agent.ainvoke(
     {"messages": [("human", request.message)]},
-    config=config,
+    config={"configurable": {"thread_id": request.thread_id}},  # → checkpointer (단기 기억)
+    context=AgentContext(user_id=request.user_id),               # → inject_memory + tools (장기 기억)
 )
 ```
 
 **비유: 택배 송장**
 
 ```
-config = 택배 송장
-
-thread_id: "어떤 배송 건인지" (단기 기억 — 이번 배송)
+thread_id (config): "어떤 배송 건인지" (단기 기억 — 이번 배송)
   InMemorySaver: "sess-001이 이 대화 내역이야"
 
-user_id: "누구에게 배달하는지" (장기 기억 — 고객 정보)
+user_id (context): "누구에게 배달하는지" (장기 기억 — 고객 정보)
   inject_memory: "cust-001의 선호도를 꺼내서 prompt에 넣어줘"
   save_user_preference: "cust-001의 선호도를 저장해줘"
 ```
 
-**config["configurable"]의 의미:**
+**config vs context 역할 분리:**
 
 ```
-configurable = "실행 시점에 설정 가능한 값들"
+config["configurable"]: LangGraph 인프라용 (checkpointer의 thread_id 등)
+context:                비즈니스 로직용 (user_id, user_tier 등)
 
-LangGraph는 configurable 안의 값들을 약속된 키로 자동 분배:
-  "thread_id" → checkpointer에게 전달
-  나머지 값들 → config["configurable"]로 tools와 prompt callable에서 접근
+create_agent에 context_schema=AgentContext를 선언하면
+  → ainvoke(context=AgentContext(...))로 전달한 값을
+  → 미들웨어/도구에서 runtime.context.user_id로 타입 안전하게 접근
 ```
 
 ---
@@ -638,12 +633,12 @@ Agent가 이전 대화 맥락을 보고 답변
 [장기 기억 흐름]
 새 요청 (어떤 thread_id든)
      ↓
-config["configurable"]["user_id"] = "cust-001"
+context=AgentContext(user_id="cust-001")
      ↓
-inject_memory(state, config) 호출
-  → store.search(("user_preferences", "cust-001"))
+inject_memory(request, handler) 호출
+  → request.runtime.store.search(("user_preferences", "cust-001"))
   → 저장된 선호도 발견
-  → system_prompt에 "[사용자 선호도]\n- language: 한국어" 추가
+  → request.override(system_prompt=base + "[사용자 선호도]\n- language: 한국어")
      ↓
 Agent가 한국어로 답변 (고객이 다시 요청 안 해도!)
 ```
@@ -662,10 +657,10 @@ Agent가 한국어로 답변 (고객이 다시 요청 안 해도!)
 - namespace가 `("user_preferences", user_id)` tuple인 이유 이해
 
 ### tools.py
-- InjectedStore가 하는 일 이해
-- config와 store가 LLM 스키마에 노출되지 않는 이유 이해
+- `ToolRuntime[AgentContext]`가 context와 store를 함께 주입하는 방식 이해
+- runtime이 LLM 스키마에 노출되지 않는 이유 이해
 - namespace를 통한 사용자 격리 이해
-- store.put과 store.search 사용법 이해
+- runtime.store.put과 runtime.store.search 사용법 이해
 
 ### agent.py
 - InMemorySaver(단기) vs InMemoryStore(장기) 차이 이해

@@ -75,11 +75,14 @@ POST /chat {"message": "씨발 환불해줘", "user_id": "cust-001", "thread_id"
 
 ---
 
-## Step 1: `agent/tools.py` 읽기 — ToolRuntime 마이그레이션 (15분)
+## Step 1: `agent/tools.py` 읽기 — ToolRuntime (15분)
 
 ### 목표
 
-`InjectedStore + RunnableConfig`에서 `ToolRuntime[AgentContext]`로 바뀐 이유와 차이를 이해
+도구가 `ToolRuntime[AgentContext]` 하나로 context와 store를 함께 주입받는 방식을 이해
+
+> 참고(히스토리): 초기 구현은 `config: RunnableConfig` + `store: Annotated[BaseStore, InjectedStore()]`
+> 두 파라미터로 나눠 받았으나, 현재는 공식 권장인 `ToolRuntime[AgentContext]` 하나로 통합되었다.
 
 ---
 
@@ -135,7 +138,7 @@ from langchain.tools import ToolRuntime   # ✅ 공식 LangChain API
 
 ### 학습 질문
 
-- Phase 3의 `config["configurable"].get("user_id")` 와 Phase 4의 `runtime.context.user_id`는 어떻게 다른가?
+- `config["configurable"].get("user_id")` 방식 대신 `runtime.context.user_id`를 쓰면 무엇이 좋은가?
 - `runtime.context`가 `None`일 수 있는 상황은?
 - `ToolRuntime[AgentContext]`의 제네릭 타입 파라미터 `AgentContext`의 역할은?
 
@@ -346,7 +349,7 @@ hash:   결정론적 해시로 대체 (분석용)
 ### 핵심 개념 3: context_schema — user_id 전달 방식
 
 ```python
-result = await agent.invoke(
+result = await agent.ainvoke(
     {"messages": [("human", message)]},
     config={"configurable": {"thread_id": thread_id}},  # thread_id만
     context=AgentContext(user_id=user_id),               # user_id는 context로 전달
@@ -391,7 +394,7 @@ if blocked:
     return {..., "status": "blocked"}
 
 # [2] Agent 실행
-result = await agent.invoke(
+result = await agent.ainvoke(
     {"messages": [("human", request.message)]},
     config={"configurable": {"thread_id": request.thread_id}},  # thread_id만
     context=AgentContext(user_id=request.user_id),               # user_id는 context로
