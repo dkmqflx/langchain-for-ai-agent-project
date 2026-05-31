@@ -46,7 +46,7 @@ After Guardrail (에이전트 실행 후):
 [수정된 파일]
 agent/context.py    → 변경 없음
 agent/tools.py      → InjectedStore+RunnableConfig → ToolRuntime[AgentContext]
-agent/middleware.py → inject_memory (@before_model 함수), is_blocked_input, check_hallucination 추가
+agent/middleware.py → inject_memory (@wrap_model_call 함수), is_blocked_input, check_hallucination 추가
 agent/agent.py      → PIIMiddleware + middleware=[] 추가
 routers/chat.py     → Before/After Guardrail 통합, context= 방식으로 변경
 
@@ -60,9 +60,9 @@ POST /chat {"message": "씨발 환불해줘", "user_id": "cust-001", "thread_id"
       config={thread_id}             → checkpointer가 사용 (단기 기억)
     )
      ┌─ 에이전트 내부 ─────────────────────────────────────────┐
-     │  inject_memory (before_model)       → system prompt 주입  │
      │  PIIMiddleware.before_model         → 입력 PII 마스킹      │
-     │  ---- 모델 호출 ----                                       │
+     │  inject_memory (wrap_model_call)    → system prompt 주입  │
+     │  ---- 모델 호출 (handler) ----                            │
      │  PIIMiddleware.after_model          → 출력 PII 마스킹      │
      └──────────────────────────────────────────────────────────┘
      ↓
@@ -145,12 +145,12 @@ from langchain.tools import ToolRuntime   # ✅ 공식 LangChain API
 
 ### 목표
 
-`@before_model` 데코레이터 패턴이 어떻게 작동하는지,
+`@wrap_model_call` 데코레이터 패턴이 어떻게 작동하는지,
 클래스 기반이 아닌 함수 기반 미들웨어로 어떻게 정의하는지 이해
 
 ---
 
-### 핵심 개념 1: inject_memory — @before_model 데코레이터 방식
+### 핵심 개념 1: inject_memory — @wrap_model_call 데코레이터 방식
 
 ```python
 # agent.py
@@ -158,67 +158,79 @@ _agent = create_agent(
     model=_llm,
     tools=[...],
     system_prompt=SYSTEM_PROMPT,  # ← 정적 문자열
-    middleware=[inject_memory],   # ← @before_model 함수를 직접 전달
+    middleware=[inject_memory],   # ← @wrap_model_call 함수를 직접 전달
 )
 
 # middleware.py
-from langchain.agents.middleware import before_model
+from typing import Callable
+from langchain.agents.middleware import wrap_model_call, ModelRequest, ModelResponse
 
-@before_model
-def inject_memory(state, runtime: Runtime) -> dict | None:
-    user_id = runtime.context.user_id
-    items = runtime.store.search(("user_preferences", user_id))
-    # SystemMessage 찾아서 선호도 추가
-    ...
-    return {"messages": updated_messages}
+@wrap_model_call
+async def inject_memory(request: ModelRequest, handler: Callable) -> ModelResponse:
+    user_id = request.runtime.context.user_id
+    items = request.runtime.store.search(("user_preferences", user_id))
+    # base system_prompt 보존 + 선호도 덧붙여 override
+    request = request.override(system_prompt=request.system_prompt + memory_text)
+    return await handler(request)
 ```
 
-`system_prompt=` 파라미터는 정적 문자열을 받고, 동적 주입은 `@before_model` 데코레이터 함수로 처리합니다.
+`system_prompt=` 파라미터는 정적 문자열을 받고, 동적 주입은 `@wrap_model_call` 데코레이터 함수로 처리합니다.
 
 ---
 
-### 핵심 개념 2: @before_model 데코레이터 훅
+### 핵심 개념 2: @wrap_model_call 데코레이터 훅
 
 ```python
-from langchain.agents.middleware import before_model
+from typing import Callable
+from langchain.agents.middleware import wrap_model_call, ModelRequest, ModelResponse
 
-@before_model
-def inject_memory(state: Any, runtime: Runtime) -> dict | None:
-    # runtime.store   → InMemoryStore (store= 파라미터로 주입된 것)
-    # runtime.context → AgentContext (context=AgentContext(...) 로 전달된 것)
-    
-    if not runtime.store or not runtime.context:
-        return None  # 변경 없음
-    
-    items = runtime.store.search(("user_preferences", runtime.context.user_id))
-    
+@wrap_model_call
+async def inject_memory(request: ModelRequest, handler: Callable) -> ModelResponse:
+    # request.runtime.store   → InMemoryStore (store= 파라미터로 주입된 것)
+    # request.runtime.context → AgentContext (context=AgentContext(...) 로 전달된 것)
+
+    if not request.runtime.store or not request.runtime.context:
+        return await handler(request)  # 그대로 모델 호출
+
+    items = request.runtime.store.search(
+        ("user_preferences", request.runtime.context.user_id)
+    )
+
     if not items:
-        return None  # 선호도 없으면 변경 없음
-    
-    # SystemMessage 찾아서 선호도 추가
-    messages = list(state["messages"])
-    for i, msg in enumerate(messages):
-        if isinstance(msg, SystemMessage):
-            messages[i] = SystemMessage(content=msg.content + memory_text)
-            return {"messages": messages}  # 변경된 state 반환
-    
-    return None
+        return await handler(request)  # 선호도 없으면 그대로 모델 호출
+
+    # base system_prompt를 보존하고 선호도를 덧붙여 override
+    base_prompt = request.system_prompt or ""
+    request = request.override(system_prompt=base_prompt + memory_text)
+    return await handler(request)  # 수정된 request로 모델 호출
 ```
 
-**before_model 반환값 의미:**
+**wrap_model_call 동작 방식:**
 
 ```
-None 반환:       state 변경 없음 (선호도 없을 때)
-dict 반환:       반환된 dict로 state 업데이트
-                 {"messages": [...]} → 메시지 목록을 교체
+(request, handler) 시그니처:
+  request  → 모델 호출 정보. request.system_prompt로 현재 system prompt 읽기
+  handler  → 실제 모델 호출 함수. 반드시 await handler(request)를 호출해야 모델 실행
+
+핵심 패턴:
+  request.override(system_prompt=...)  → 수정된 새 request 반환
+  return await handler(request)        → 수정된(또는 원본) request로 모델 호출
 ```
 
-**Phase 3의 inject_memory와 차이:**
+**왜 async def이고, before_model이 아니라 wrap_model_call인가:**
 
 ```
-Phase 3: [SystemMessage] + 기존 메시지 → 항상 SystemMessage를 앞에 추가
-Phase 4: 기존 SystemMessage를 찾아서 content에 선호도 덧붙임
-         이유: create_agent가 system_prompt=를 이미 SystemMessage로 추가해뒀기 때문
+async def:       chat.py가 `await agent.ainvoke(...)`로 실행 → 미들웨어도 async여야 함.
+                 sync def로 정의하면 async 경로에서 base awrap_model_call이
+                 NotImplementedError를 raise (매 요청 500). async def면 awrap_model_call
+                 훅으로 등록되어 정상 동작.
+
+wrap_model_call: 그 모델 호출에만 적용되는 system_prompt를 override
+                 → state는 안 건드림. 매 호출마다 base SYSTEM_PROMPT에서 새로
+                   시작하므로 선호도가 중복 누적되지 않음 (공식 권장 패턴)
+
+주의: request.override(system_prompt=memory_text)처럼 base를 빼면
+      역할/도구 지침이 통째로 사라짐 → 반드시 base_prompt + memory_text
 ```
 
 ---
@@ -257,9 +269,9 @@ def check_hallucination(answer: str, context: str) -> str:
 
 ### 학습 질문
 
-- `before_model`이 `None`을 반환할 때와 `{"messages": [...]}`를 반환할 때의 차이는?
-- `@before_model` 데코레이터 함수와 클래스 기반 `AgentMiddleware`의 차이는 무엇인가?
-- `@before_model` vs `@after_model` — 각각 어떤 시점에 실행되는가?
+- `wrap_model_call`에서 `await handler(request)`를 호출하지 않으면 어떻게 되는가?
+- `inject_memory`를 `async def`가 아니라 `def`로 정의하면 `ainvoke` 경로에서 무슨 일이 생기는가?
+- `request.override(system_prompt=...)`에서 base를 빼면 어떤 문제가 생기는가?
 
 ---
 
@@ -281,7 +293,7 @@ _agent = create_agent(
     tools=[...],
     system_prompt=SYSTEM_PROMPT,  # str/SystemMessage
     middleware=[                   # 공식 middleware= 파라미터
-        inject_memory,             # @before_model 데코레이터 함수
+        inject_memory,             # @wrap_model_call 데코레이터 함수
         PIIMiddleware("email", ...),
         PIIMiddleware("credit_card", ...),
     ],
@@ -524,7 +536,9 @@ agent.invoke() 완료
 - `from langchain.tools import ToolRuntime`이 공식 import 경로임을 이해
 
 ### agent/middleware.py
-- `before_model(state, runtime)` 훅의 반환값 의미 이해 (None vs dict)
+- `inject_memory`의 `(request, handler)` wrap_model_call 패턴 이해
+- `async def` + `await handler(request)`가 필요한 이유 이해 (ainvoke 경로)
+- `request.override(system_prompt=base + memory_text)`로 base 보존하는 이유 이해
 - `is_blocked_input` 단락 패턴의 필요성 이해
 - `check_hallucination`이 search_contexts 있을 때만 호출되는 이유 이해
 

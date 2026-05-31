@@ -131,7 +131,7 @@ Phase 2까지는 모든 사용자에게 동일한 system prompt가 전달됩니�
   (선호도 반영 불가)
 ```
 
-Phase 3는 `inject_memory` (@before_model 데코레이터)로 요청마다 사용자별 선호도를 system prompt에 동적으로 주입합니다.
+Phase 3는 `inject_memory` (@wrap_model_call 데코레이터)로 요청마다 사용자별 선호도를 system prompt에 동적으로 주입합니다.
 
 ```
 요청마다 선호도 조회 → 사용자별 다른 prompt:
@@ -145,42 +145,61 @@ Phase 3는 `inject_memory` (@before_model 데코레이터)로 요청마다 사�
 ### 핵심 개념 2: inject_memory 내부 동작
 
 ```python
-from langchain.agents.middleware import before_model
+from typing import Callable
+from langchain.agents.middleware import wrap_model_call, ModelRequest, ModelResponse
 
-@before_model
-def inject_memory(state, runtime: Runtime) -> dict | None:
-    # [1] runtime에서 user_id 추출
-    user_id = runtime.context.user_id
-    
+@wrap_model_call
+async def inject_memory(request: ModelRequest, handler: Callable) -> ModelResponse:
+    # [1] runtime에서 user_id 추출 (request.runtime로 접근)
+    if not request.runtime.store or not request.runtime.context:
+        return await handler(request)  # store/context 없으면 그대로 진행
+    user_id = request.runtime.context.user_id
+
     # [2] store에서 해당 사용자의 선호도 조회
     namespace = ("user_preferences", user_id)
-    items = runtime.store.search(namespace)
-    
+    items = request.runtime.store.search(namespace)
+
     if not items:
-        return None  # 선호도 없으면 변경 없음
-    
+        return await handler(request)  # 선호도 없으면 그대로 진행
+
     # [3] 선호도를 문자열로 변환
     preferences = "\n".join(
         f"- {item.key}: {item.value['value']}" for item in items
     )
     memory_text = f"\n\n[사용자 선호도 - 반드시 반영하세요]\n{preferences}"
-    
-    # [4] 기존 SystemMessage에 선호도 추가
-    messages = list(state["messages"])
-    for i, msg in enumerate(messages):
-        if isinstance(msg, SystemMessage):
-            messages[i] = SystemMessage(content=msg.content + memory_text)
-            return {"messages": messages}
-    
-    return None
+
+    # [4] 기존 system_prompt를 보존하고 선호도를 덧붙여 override
+    #     base를 보존하지 않으면 역할/도구 지침이 통째로 사라짐
+    base_prompt = request.system_prompt or ""
+    request = request.override(system_prompt=base_prompt + memory_text)
+    return await handler(request)  # 수정된 request로 모델 호출
 ```
 
-**before_model 반환값 의미:**
+**wrap_model_call 동작 방식:**
 
 ```
-None 반환:       state 변경 없음 (선호도 없을 때)
-dict 반환:       반환된 dict로 state 업데이트
-                 {"messages": [...]} → 메시지 목록을 교체
+(request, handler) 시그니처:
+  request  → 모델 호출 정보 (system_prompt, messages, model, tools 등)
+  handler  → 실제 모델 호출 함수. await handler(request)를 호출해야 모델이 실행됨
+
+핵심 패턴:
+  - request.override(system_prompt=...) → 수정된 새 request 반환
+  - return await handler(request)       → 수정된 request로 모델 호출
+  - 조건 미충족 시 그냥 return await handler(request) → 원본 그대로 진행
+
+before_model(state 수정)과 달리, wrap_model_call은 "모델 호출 자체를 감싸서"
+그 호출에만 적용되는 system_prompt를 만든다. state의 메시지는 건드리지 않으므로
+매 모델 호출마다 항상 base SYSTEM_PROMPT에서 새로 시작 → 선호도 중복 누적 없음.
+```
+
+**왜 async 함수인가:**
+
+```
+chat.py는 FastAPI 비동기 핸들러에서 `await agent.ainvoke(...)`로 실행한다.
+@wrap_model_call에 sync 함수를 넘기면 sync wrap_model_call 훅만 등록되고,
+async 경로(ainvoke)에서 호출되는 awrap_model_call은 base 기본 구현
+(NotImplementedError를 raise)으로 남는다 → 매 요청 500 에러.
+→ async def로 정의하면 awrap_model_call 훅으로 등록되어 ainvoke에서 정상 동작.
 ```
 
 **namespace가 tuple인 이유:**
@@ -195,9 +214,9 @@ LangGraph Store는 계층적 네임스페이스 지원.
 
 ### 학습 질문
 
-- items가 빈 리스트일 때 어떤 값이 반환되는가?
+- items가 빈 리스트일 때 `handler(request)`가 그대로 호출되는 이유는?
 - `store.search(namespace)`에서 namespace가 tuple인 이유는 무엇일까?
-- `before_model`이 `None`을 반환할 때와 `{"messages": [...]}`를 반환할 때의 차이는?
+- `request.override(system_prompt=memory_text)`처럼 base를 빼면 어떤 문제가 생기는가?
 
 ---
 
@@ -457,7 +476,7 @@ Phase 3:
       model=_llm,
       tools=[search_documents, save_user_preference, get_user_preferences],
       system_prompt=SYSTEM_PROMPT,
-      middleware=[inject_memory],  # ← 장기 기억 동적 주입 (@before_model 데코레이터 함수)
+      middleware=[inject_memory],  # ← 장기 기억 동적 주입 (@wrap_model_call 데코레이터 함수)
       checkpointer=_checkpointer,            # ← 단기 기억 추가
       store=_store,                          # ← 장기 기억 추가
       context_schema=AgentContext,
@@ -638,8 +657,8 @@ Agent가 한국어로 답변 (고객이 다시 요청 안 해도!)
 - user_tier 필드가 지금 당장은 안 쓰이는데 왜 있는지 이해
 
 ### middleware.py
-- `inject_memory` (@before_model 데코레이터) 훅의 반환값 의미 이해 (None vs dict)
-- 기존 SystemMessage에 선호도를 덧붙이는 방식 이해
+- `inject_memory` (@wrap_model_call 데코레이터)의 `(request, handler)` 패턴 이해
+- `request.override(system_prompt=base + memory_text)`로 base 보존하며 주입하는 방식 이해
 - namespace가 `("user_preferences", user_id)` tuple인 이유 이해
 
 ### tools.py
