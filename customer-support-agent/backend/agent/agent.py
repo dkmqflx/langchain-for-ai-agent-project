@@ -1,7 +1,9 @@
 """
 미들웨어 실행 순서 (에이전트 내부):
-  wrap_model_call 순서: inject_memory → PIIMiddleware(email) → PIIMiddleware(card)
-  after_model 순서:  PIIMiddleware(card) → PIIMiddleware(email)
+  inject_memory: wrap_model_call 훅 — 모델 호출을 감싸 system_prompt에 선호도 주입
+  PIIMiddleware: before_model(입력 마스킹) / after_model(출력 마스킹) 훅
+    before_model 순서: PIIMiddleware(email) → PIIMiddleware(card)
+    after_model 순서:  PIIMiddleware(card) → PIIMiddleware(email)
 
 PIIMiddleware 커스텀 detector 사유:
   기본 detector는 한국어 앞뒤 이메일과 하이픈 카드번호를 탐지 못함.

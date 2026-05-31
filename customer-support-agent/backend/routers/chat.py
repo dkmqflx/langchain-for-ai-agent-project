@@ -24,7 +24,7 @@ async def chat(request: ChatRequest):
 
     흐름:
       1. Before Guardrail: 욕설 차단 → 차단 시 즉시 반환
-      2. Agent 실행 (내부에서 PIIMiddleware, InjectMemoryMiddleware 자동 실행)
+      2. Agent 실행 (내부에서 inject_memory, PIIMiddleware 자동 실행)
       3. 검색 컨텍스트 추출 (search_documents ToolMessage 수집)
       4. After Guardrail: 할루시네이션 검증 (컨텍스트 있을 때만)
 
@@ -50,7 +50,7 @@ async def chat(request: ChatRequest):
 
         # [2] Agent 실행
         # thread_id: checkpointer용 (단기 기억)
-        # context:   AgentContext로 user_id 전달 → InjectMemoryMiddleware + ToolRuntime에서 사용
+        # context:   AgentContext로 user_id 전달 → inject_memory + ToolRuntime에서 사용
         result = await agent.ainvoke(
             {"messages": [("human", request.message)]},
             config={"configurable": {"thread_id": request.thread_id}},

@@ -46,25 +46,33 @@ SYSTEM_PROMPT = """당신은 B2B SaaS 고객 지원 에이전트입니다.
 # ─── Phase 3: inject_memory ────────────────────────────────────────────────────
 
 @wrap_model_call
-def inject_memory(request: ModelRequest, handler: Callable) -> ModelResponse:
-    """장기 기억을 system prompt에 동적으로 주입하는 미들웨어."""
+async def inject_memory(request: ModelRequest, handler: Callable) -> ModelResponse:
+    """장기 기억을 system prompt에 동적으로 주입하는 미들웨어.
+
+    async 함수인 이유: chat.py가 `await agent.ainvoke(...)`로 실행하므로
+    sync 함수만 정의하면 base awrap_model_call이 NotImplementedError를 발생시킴.
+    @wrap_model_call에 async 함수를 넘기면 awrap_model_call 훅으로 등록됨.
+    """
     if not request.runtime.store or not request.runtime.context:
-        return handler(request)
+        return await handler(request)
 
     user_id = request.runtime.context.user_id
     namespace = ("user_preferences", user_id)
     items = request.runtime.store.search(namespace)
 
     if not items:
-        return handler(request)
+        return await handler(request)
 
     preferences = "\n".join(
         f"- {item.key}: {item.value['value']}" for item in items
     )
     memory_text = f"\n\n[사용자 선호도 - 반드시 반영하세요]\n{preferences}"
 
-    request = request.override(system_prompt=memory_text)
-    return handler(request)
+    # 기존 system_prompt(역할/도구 지침)를 보존하고 선호도를 덧붙임.
+    # override(system_prompt=memory_text)만 하면 base 지침이 통째로 사라짐.
+    base_prompt = request.system_prompt or ""
+    request = request.override(system_prompt=base_prompt + memory_text)
+    return await handler(request)
 
 
 # ─── Phase 4: Before Guardrail (욕설/부적절 콘텐츠 차단) ─────────────────────
