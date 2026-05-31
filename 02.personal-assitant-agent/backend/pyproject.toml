@@ -1,0 +1,22 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "AI 개인 비서 에이전트 백엔드 (Phase 1: Google OAuth2 인증)"
+requires-python = ">=3.14"
+dependencies = [
+    # Web
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "itsdangerous>=2.0.0",          # Starlette SessionMiddleware (OAuth state 보관)
+    # Config
+    "pydantic-settings>=2.0.0",
+    # Database
+    "sqlalchemy>=2.0.0",
+    "psycopg[binary]>=3.1.0",
+    # Google OAuth2 + API (공식 라이브러리)
+    "google-auth>=2.0.0",
+    "google-auth-oauthlib>=1.2.0",
+    "google-api-python-client>=2.0.0",
+    # Token 암호화
+    "cryptography>=42.0.0",
+]
