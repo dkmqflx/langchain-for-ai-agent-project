@@ -131,6 +131,7 @@ Rules:
 - `langchain-community` is sunset — do **not** import from it. Use standalone integration packages or `langchain_core` equivalents.
 - `langchain_classic` re-exports are acceptable only when they pass the deprecation warning test (no `DeprecationWarning` emitted on import).
 - Every import must be verified as actually importable in the project venv before it is added to the codebase.
+- FastAPI code must follow the official FastAPI documentation patterns: `APIRouter` for route grouping, Pydantic models for request/response bodies, `Depends` for dependency injection, the `lifespan` context manager for startup/shutdown, and `async def` endpoints. Prefer framework-provided mechanisms over hand-rolled equivalents.
 
 ## Implementation Phases
 
