@@ -1,13 +1,13 @@
 """
 Phase 3/4 미들웨어 모음
 
-Phase 3: InjectMemoryMiddleware — 장기 기억을 system prompt에 동적으로 주입
+Phase 3: inject_memory — 장기 기억을 system prompt에 동적으로 주입
 Phase 4: PIIMiddleware (langchain 내장), is_blocked_input, check_hallucination
 
 === create_agent 미들웨어 구조 ===
 
 system_prompt=SYSTEM_PROMPT        ← 정적 문자열
-middleware=[InjectMemoryMiddleware(), PIIMiddleware(...)]
+middleware=[inject_memory, PIIMiddleware(...)]
 context_schema=AgentContext        ← context로 user_id 전달
 ToolRuntime[AgentContext]          ← 도구에서 store/context 접근
 
@@ -16,19 +16,17 @@ ToolRuntime[AgentContext]          ← 도구에서 store/context 접근
 요청 처리 파이프라인 (chat.py):
   [1] is_blocked_input      → Before Guardrail (에이전트 실행 전 단락)
   [2] agent.invoke(...)     → 에이전트 내부에서 미들웨어 자동 실행:
-        InjectMemoryMiddleware.before_model  → 장기 기억 주입
+        inject_memory (wrap_model_call)      → 장기 기억 주입
         PIIMiddleware.before_model           → 입력 PII 마스킹
         ---- 모델 호출 ----
         PIIMiddleware.after_model            → 출력 PII 마스킹
   [3] check_hallucination   → After Guardrail (에이전트 실행 후)
 """
 
-from typing import Any
+from typing import Callable
 
-from langchain_core.messages import SystemMessage
 from langchain_openai import ChatOpenAI
-from langchain.agents.middleware import AgentMiddleware
-from langgraph.runtime import Runtime
+from langchain.agents.middleware import wrap_model_call, ModelRequest, ModelResponse
 
 # ─── System Prompt ─────────────────────────────────────────────────────────────
 
@@ -45,45 +43,28 @@ SYSTEM_PROMPT = """당신은 B2B SaaS 고객 지원 에이전트입니다.
   - 고객이 선호도(언어, 응답 스타일 등)를 요청하면 save_user_preference 도구로 저장하세요.
 """
 
-# ─── Phase 3: InjectMemoryMiddleware ───────────────────────────────────────────
+# ─── Phase 3: inject_memory ────────────────────────────────────────────────────
 
-class InjectMemoryMiddleware(AgentMiddleware):
-    """
-    장기 기억을 system prompt에 동적으로 주입하는 미들웨어.
+@wrap_model_call
+def inject_memory(request: ModelRequest, handler: Callable) -> ModelResponse:
+    """장기 기억을 system prompt에 동적으로 주입하는 미들웨어."""
+    if not request.runtime.store or not request.runtime.context:
+        return handler(request)
 
-    before_model 훅에서 runtime.store와 runtime.context.user_id로
-    사용자 선호도를 조회하고, SystemMessage에 추가한다.
+    user_id = request.runtime.context.user_id
+    namespace = ("user_preferences", user_id)
+    items = request.runtime.store.search(namespace)
 
-    선호도가 없으면 None 반환 → state 변경 없음 (system_prompt 그대로).
-    선호도가 있으면 첫 번째 SystemMessage의 content에 선호도 텍스트를 덧붙임.
-    """
+    if not items:
+        return handler(request)
 
-    def before_model(self, state: Any, runtime: Runtime) -> dict | None:
-        if not runtime.store or not runtime.context:
-            return None
+    preferences = "\n".join(
+        f"- {item.key}: {item.value['value']}" for item in items
+    )
+    memory_text = f"\n\n[사용자 선호도 - 반드시 반영하세요]\n{preferences}"
 
-        user_id = runtime.context.user_id
-        namespace = ("user_preferences", user_id)
-        items = runtime.store.search(namespace)
-
-        if not items:
-            return None
-
-        preferences = "\n".join(
-            f"- {item.key}: {item.value['value']}" for item in items
-        )
-        memory_text = f"\n\n[사용자 선호도 - 반드시 반영하세요]\n{preferences}"
-
-        messages = list(state["messages"])
-        for i, msg in enumerate(messages):
-            if isinstance(msg, SystemMessage):
-                messages[i] = SystemMessage(content=msg.content + memory_text)
-                return {"messages": messages}
-
-        return None
-
-    async def abefore_model(self, state: Any, runtime: Runtime) -> dict | None:
-        return self.before_model(state, runtime)
+    request = request.override(system_prompt=memory_text)
+    return handler(request)
 
 
 # ─── Phase 4: Before Guardrail (욕설/부적절 콘텐츠 차단) ─────────────────────

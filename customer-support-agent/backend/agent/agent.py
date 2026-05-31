@@ -1,7 +1,7 @@
 """
 미들웨어 실행 순서 (에이전트 내부):
-  before_model 순서: InjectMemoryMiddleware → PIIMiddleware(email) → PIIMiddleware(card)
-  after_model 순서:  PIIMiddleware(card) → PIIMiddleware(email) → InjectMemoryMiddleware(없음)
+  wrap_model_call 순서: inject_memory → PIIMiddleware(email) → PIIMiddleware(card)
+  after_model 순서:  PIIMiddleware(card) → PIIMiddleware(email)
 
 PIIMiddleware 커스텀 detector 사유:
   기본 detector는 한국어 앞뒤 이메일과 하이픈 카드번호를 탐지 못함.
@@ -15,7 +15,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.store.memory import InMemoryStore
 
 from agent.context import AgentContext
-from agent.middleware import SYSTEM_PROMPT, InjectMemoryMiddleware
+from agent.middleware import SYSTEM_PROMPT, inject_memory
 from agent.tools import get_user_preferences, save_user_preference, search_documents
 
 _llm = ChatOpenAI(
@@ -32,7 +32,7 @@ _agent = create_agent(
     tools=[search_documents, save_user_preference, get_user_preferences],
     system_prompt=SYSTEM_PROMPT,
     middleware=[
-        InjectMemoryMiddleware(),
+        inject_memory,
         PIIMiddleware(
             "email",
             detector=r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
