@@ -6,13 +6,21 @@ user_id는 context_schema=AgentContext로 선언된 AgentContext를 통해 전�
 thread_id는 checkpointer용으로 config["configurable"]에 전달.
 """
 
+import json
+
 from langchain_core.messages import ToolMessage
-from langgraph.types import Command
+from langgraph.types import Command  # interrupt된 그래프를 재개할 때 사용
 from fastapi import APIRouter, HTTPException
+from sse_starlette import EventSourceResponse
 
 from agent.agent import get_agent
 from agent.context import AgentContext
 from agent.middleware import check_hallucination, is_blocked_input
+from agent.streaming import (
+    extract_interrupt_action,
+    is_final_answer_chunk,
+    is_search_tool_result,
+)
 from models.chat import ChatRequest, ConfirmRequest
 
 router = APIRouter()
@@ -167,3 +175,130 @@ async def confirm(request: ConfirmRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """고객 메시지를 SSE로 스트리밍 처리한다.
+
+    단일 엔드포인트가 agent.astream 을 관찰하며 내부 분기한다:
+      - 욕설 차단      → event:blocked 후 종료 (에이전트 미실행)
+      - 일반 답변      → event:token 으로 토큰 실시간 전송
+      - RAG 답변(검색) → 토큰 버퍼링 → 할루시네이션 검사본을 event:message 1회 전송
+      - 환불 interrupt → event:confirmation_required 후 종료 (재개는 기존 POST /chat/confirm)
+    종료 시 event:done, 오류 시 event:error.
+
+    학습용 한계(설계 문서 기재): 스트리밍된 token 은 PIIMiddleware 출력 마스킹과
+    할루시네이션 검사 '이전' 단계다. 출력 PII 마스킹·할루시네이션 교정의 완전한 보장은
+    비스트리밍 POST /chat 경로에서만 이뤄진다. 입력 마스킹(apply_to_input)에 의존한다.
+
+    이벤트 프로토콜 (data는 모두 JSON 문자열):
+      token                 {"content": "..."}
+      message               {"response": "...", "thread_id": "...", "status": "completed"}
+      blocked               {"response": "...", "thread_id": "..."}
+      confirmation_required {"thread_id": "...", "tool": "...", "args": {...}}
+      done                  {"thread_id": "...", "status": "completed"}
+      error                 {"detail": "..."}
+    """
+
+    async def event_generator():
+        try:
+            # [1] Before Guardrail: 욕설/부적절 입력 차단 (에이전트 실행 전)
+            blocked, reason = is_blocked_input(request.message)
+            if blocked:
+                yield {
+                    "event": "blocked",
+                    "data": json.dumps(
+                        {"response": reason, "thread_id": request.thread_id},
+                        ensure_ascii=False,
+                    ),
+                }
+                return
+
+            agent = get_agent()
+            config = {"configurable": {"thread_id": request.thread_id}}
+
+            used_search = False          # search_documents 사용 여부
+            search_contexts: list[str] = []  # 할루시네이션 검사용 검색 컨텍스트
+            answer_buffer: list[str] = []    # 검색 사용 시 최종 답변 토큰 버퍼
+            interrupt_action = None          # 환불 interrupt action {name,args}
+
+            # [2] astream 으로 실행하며 관찰
+            # stream_mode=["updates","messages"]: 토큰(messages) + interrupt(updates) 동시 수신
+            async for mode, payload in agent.astream(
+                {"messages": [("human", request.message)]},
+                config=config,
+                context=AgentContext(user_id=request.user_id),
+                stream_mode=["updates", "messages"],
+            ):
+                if mode == "updates":
+                    action = extract_interrupt_action(payload)
+                    if action is not None:
+                        interrupt_action = action
+                        break  # 환불 본인 확인 필요 → 스트림 중단
+                elif mode == "messages":
+                    chunk, metadata = payload
+                    if is_search_tool_result(chunk):
+                        used_search = True
+                        search_contexts.append(chunk.content)
+                    elif is_final_answer_chunk(chunk, metadata):
+                        if used_search:
+                            # RAG 답변: 흘리지 않고 버퍼링 (검사 후 한 번에 전송)
+                            answer_buffer.append(chunk.content)
+                        else:
+                            # 일반 답변: 토큰 실시간 전송
+                            yield {
+                                "event": "token",
+                                "data": json.dumps(
+                                    {"content": chunk.content}, ensure_ascii=False
+                                ),
+                            }
+
+            # [3] 스트림 종료 후 분기
+            if interrupt_action is not None:
+                yield {
+                    "event": "confirmation_required",
+                    "data": json.dumps(
+                        {
+                            "thread_id": request.thread_id,
+                            "tool": interrupt_action["name"],
+                            "args": interrupt_action["args"],
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+                return
+
+            if used_search:
+                # RAG 답변: 검색 컨텍스트로 할루시네이션 검사 후 완성본 전송
+                combined_context = "\n\n---\n\n".join(search_contexts)
+                answer = "".join(answer_buffer)
+                checked = check_hallucination(answer, combined_context)
+                yield {
+                    "event": "message",
+                    "data": json.dumps(
+                        {
+                            "response": checked,
+                            "thread_id": request.thread_id,
+                            "status": "completed",
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+
+            yield {
+                "event": "done",
+                "data": json.dumps(
+                    {"thread_id": request.thread_id, "status": "completed"},
+                    ensure_ascii=False,
+                ),
+            }
+
+        except Exception as e:
+            # 스트림 시작 후에는 상태코드 변경 불가 → error 이벤트로 전달
+            yield {
+                "event": "error",
+                "data": json.dumps({"detail": str(e)}, ensure_ascii=False),
+            }
+
+    return EventSourceResponse(event_generator())
