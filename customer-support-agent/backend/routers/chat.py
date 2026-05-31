@@ -51,7 +51,7 @@ async def chat(request: ChatRequest):
         # [2] Agent 실행
         # thread_id: checkpointer용 (단기 기억)
         # context:   AgentContext로 user_id 전달 → InjectMemoryMiddleware + ToolRuntime에서 사용
-        result = await agent.invoke(
+        result = await agent.ainvoke(
             {"messages": [("human", request.message)]},
             config={"configurable": {"thread_id": request.thread_id}},
             context=AgentContext(user_id=request.user_id),
