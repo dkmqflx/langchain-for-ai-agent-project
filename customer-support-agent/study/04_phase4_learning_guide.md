@@ -6,10 +6,10 @@
 
 ## Phase 4에서 새로 추가된 것
 
-Phase 3까지는 두 가지 문제가 있었습니다.
+Phase 3까지는 안전 장치가 없었습니다.
 
 ```
-[문제 1: 안전 장치 없음]
+[문제: 안전 장치 없음]
 
 고객: "씨발 환불해줘"
 Agent: "안녕하세요! 환불 정책은..." ← 욕설을 그냥 처리 😱
@@ -18,24 +18,12 @@ Agent: "안녕하세요! 환불 정책은..." ← 욕설을 그냥 처리 😱
 Agent: "1234-5678-9012-3456 카드로..." ← 카드번호를 그대로 반복 😱
 
 Agent: "환불은 7일 이내 가능합니다" ← (문서엔 30일이라고 적혀있는데 날조!)
-
-[문제 2: create_react_agent는 legacy]
-
-create_react_agent에는 middleware= 파라미터가 없어서
-LangChain 공식 PIIMiddleware를 직접 연결할 방법이 없음.
 ```
 
-Phase 4는 두 문제를 함께 해결합니다:
+Phase 4는 안전 장치를 추가합니다:
 
 ```
-[해결 1: create_agent로 마이그레이션]
-
-create_react_agent (legacy) → create_agent (현대 표준)
-  middleware=[PIIMiddleware(...), InjectMemoryMiddleware()] 추가 가능
-  context_schema=AgentContext → user_id를 context=로 전달
-  ToolRuntime[AgentContext] → 도구에서 store/context 접근
-
-[해결 2: 안전 장치 추가]
+[해결: 안전 장치 추가]
 
 PIIMiddleware (에이전트 내부):
   "내 카드 1234-5678-9012-3456..." → "내 카드 ****-****-****-3456..."
@@ -56,11 +44,10 @@ After Guardrail (에이전트 실행 후):
 
 ```
 [수정된 파일]
-agent/context.py    → 변경 없음 (create_agent의 context_schema로 그대로 사용)
+agent/context.py    → 변경 없음
 agent/tools.py      → InjectedStore+RunnableConfig → ToolRuntime[AgentContext]
-agent/middleware.py → make_inject_memory → InjectMemoryMiddleware 클래스
-                      is_blocked_input, check_hallucination 추가
-agent/agent.py      → create_react_agent → create_agent + middleware=[]
+agent/middleware.py → InjectMemoryMiddleware 클래스, is_blocked_input, check_hallucination 추가
+agent/agent.py      → PIIMiddleware + middleware=[] 추가
 routers/chat.py     → Before/After Guardrail 통합, context= 방식으로 변경
 
 [요청 처리 파이프라인]
@@ -96,28 +83,7 @@ POST /chat {"message": "씨발 환불해줘", "user_id": "cust-001", "thread_id"
 
 ---
 
-### 핵심 개념 1: Phase 3 vs Phase 4 도구 시그니처
-
-**Phase 3 (create_react_agent)**:
-
-```python
-from typing import Annotated
-from langchain_core.runnables import RunnableConfig
-from langgraph.prebuilt import InjectedStore
-from langgraph.store.base import BaseStore
-
-@tool
-def save_user_preference(
-    key: str,
-    value: str,
-    config: RunnableConfig,                      # ← LangGraph가 자동 주입
-    store: Annotated[BaseStore, InjectedStore()], # ← LangGraph가 자동 주입
-) -> str:
-    user_id = config["configurable"].get("user_id", "anonymous")
-    store.put(("user_preferences", user_id), key, {"value": value})
-```
-
-**Phase 4 (create_agent)**:
+### 핵심 개념 1: ToolRuntime[AgentContext] 도구 시그니처
 
 ```python
 from langchain.tools import ToolRuntime
@@ -132,17 +98,12 @@ def save_user_preference(
     runtime.store.put(("user_preferences", user_id), key, {"value": value})
 ```
 
-**비유: 개별 도구 vs 스위스 아미 나이프**
+**비유: 스위스 아미 나이프**
 
 ```
-Phase 3: 도구들을 따로따로 받음
-  config: 열쇠
-  store:  손전등
-  각각 어디서 왔는지 알아야 함
-
-Phase 4: ToolRuntime = 스위스 아미 나이프
-  runtime.context: 열쇠
-  runtime.store:   손전등
+ToolRuntime = 스위스 아미 나이프
+  runtime.context: 열쇠 (user_id 등 비즈니스 컨텍스트)
+  runtime.store:   손전등 (장기 기억 저장소)
   하나만 받으면 모두 접근 가능
 ```
 
@@ -158,7 +119,7 @@ LLM(손님)이 보는 주문서:
 runtime은 주문서에 없음. LangGraph가 알아서 주입.
 ```
 
-Phase 3의 `InjectedStore`와 동일한 원리지만, `ToolRuntime` 하나로 context와 store를 함께 전달합니다.
+`ToolRuntime` 하나로 context와 store를 함께 전달합니다.
 
 ---
 
@@ -189,29 +150,7 @@ from langchain.tools import ToolRuntime   # ✅ 공식 LangChain API
 
 ---
 
-### 핵심 개념 1: Phase 3 vs Phase 4 장기 기억 주입 방식
-
-**Phase 3 (callable prompt)**:
-
-```python
-# agent.py
-_agent = create_react_agent(
-    model=_llm,
-    tools=[...],
-    prompt=make_inject_memory(_store),  # ← callable을 prompt= 파라미터로 전달
-)
-
-# middleware.py
-def make_inject_memory(store: BaseStore):
-    def inject_memory(state, config: RunnableConfig) -> list:
-        user_id = config["configurable"].get("user_id", "anonymous")
-        items = store.search(("user_preferences", user_id))
-        ...
-        return [SystemMessage(...)] + list(state["messages"])
-    return inject_memory
-```
-
-**Phase 4 (AgentMiddleware)**:
+### 핵심 개념 1: InjectMemoryMiddleware — AgentMiddleware 방식
 
 ```python
 # agent.py
@@ -232,13 +171,7 @@ class InjectMemoryMiddleware(AgentMiddleware):
         return {"messages": updated_messages}
 ```
 
-**왜 바꿨는가:**
-
-```
-create_react_agent: prompt= 파라미터가 callable을 받음 → make_inject_memory 가능
-create_agent:      system_prompt= 파라미터는 str/SystemMessage만 받음 (callable 불가)
-                   대신 middleware= 파라미터를 제공 → AgentMiddleware로 동적 주입
-```
+`system_prompt=` 파라미터는 정적 문자열을 받고, 동적 주입은 `middleware=`의 `AgentMiddleware`로 처리합니다.
 
 ---
 
@@ -330,52 +263,29 @@ def check_hallucination(answer: str, context: str) -> str:
 
 ### 목표
 
-`create_react_agent`와 `create_agent`의 차이, `PIIMiddleware` 통합 방식 이해
+`create_agent` 설정 파라미터와 `PIIMiddleware` 통합 방식 이해
 
 ---
 
-### 핵심 개념 1: create_react_agent vs create_agent
+### 핵심 개념 1: create_agent 설정
 
 ```python
-# Phase 3 (create_react_agent from langgraph)
-from langgraph.prebuilt import create_react_agent
-
-_agent = create_react_agent(
-    model=_llm,
-    tools=[...],
-    prompt=make_inject_memory(_store),  # callable
-    checkpointer=_checkpointer,
-    store=_store,
-    # middleware= 파라미터 없음!
-)
-```
-
-```python
-# Phase 4 (create_agent from langchain)
 from langchain.agents import create_agent
 
 _agent = create_agent(
     model=_llm,
     tools=[...],
-    system_prompt=SYSTEM_PROMPT,  # str/SystemMessage만 (callable 불가)
-    middleware=[                   # ← 공식 middleware= 파라미터
+    system_prompt=SYSTEM_PROMPT,  # str/SystemMessage
+    middleware=[                   # 공식 middleware= 파라미터
         InjectMemoryMiddleware(),
         PIIMiddleware("email", ...),
         PIIMiddleware("credit_card", ...),
     ],
     checkpointer=_checkpointer,
     store=_store,
-    context_schema=AgentContext,   # ← user_id 전달 방식 선언
+    context_schema=AgentContext,   # user_id 전달 방식 선언
 )
 ```
-
-| 항목 | create_react_agent | create_agent |
-|------|-------------------|--------------|
-| 출처 | langgraph.prebuilt | langchain.agents |
-| middleware= | ❌ 없음 | ✅ 있음 |
-| prompt= | callable 가능 | ❌ 없음 |
-| system_prompt= | ❌ 없음 | str/SystemMessage만 |
-| context_schema= | ❌ 없음 | ✅ 있음 |
 
 ---
 
@@ -417,29 +327,17 @@ hash:   결정론적 해시로 대체 (분석용)
 
 ---
 
-### 핵심 개념 3: context_schema — user_id 전달 방식 변화
+### 핵심 개념 3: context_schema — user_id 전달 방식
 
 ```python
-# Phase 3 invoke
-result = await agent.invoke(
-    {"messages": [("human", message)]},
-    config={
-        "configurable": {
-            "thread_id": thread_id,
-            "user_id": user_id,     # ← config 안에 포함
-        }
-    },
-)
-
-# Phase 4 invoke
 result = await agent.invoke(
     {"messages": [("human", message)]},
     config={"configurable": {"thread_id": thread_id}},  # thread_id만
-    context=AgentContext(user_id=user_id),               # ← 별도 context로 분리
+    context=AgentContext(user_id=user_id),               # user_id는 context로 전달
 )
 ```
 
-**왜 분리했는가:**
+**config vs context 역할 분리:**
 
 ```
 config["configurable"]:  LangGraph 인프라용 (checkpointer의 thread_id 등)
@@ -468,25 +366,7 @@ Phase 3→4 파이프라인 변화, context= 전달 방식 이해
 
 ---
 
-### 핵심 개념: Phase 3 vs Phase 4 chat.py 비교
-
-**Phase 3:**
-
-```python
-result = await agent.invoke(
-    {"messages": [("human", request.message)]},
-    config={
-        "configurable": {
-            "thread_id": request.thread_id,
-            "user_id": request.user_id,   # ← config에 user_id
-        }
-    },
-)
-ai_message = result["messages"][-1].content
-# PII 처리 없음, 안전 장치 없음
-```
-
-**Phase 4:**
+### 핵심 개념: chat.py 파이프라인
 
 ```python
 # [1] Before Guardrail
@@ -498,7 +378,7 @@ if blocked:
 result = await agent.invoke(
     {"messages": [("human", request.message)]},
     config={"configurable": {"thread_id": request.thread_id}},  # thread_id만
-    context=AgentContext(user_id=request.user_id),               # user_id 분리
+    context=AgentContext(user_id=request.user_id),               # user_id는 context로
 )
 
 # [3] 검색 컨텍스트 추출 + [4] After Guardrail
@@ -510,15 +390,10 @@ if search_contexts:
     ai_message = check_hallucination(ai_message, "\n\n---\n\n".join(search_contexts))
 ```
 
-**PII 마스킹 위치 변화:**
+**PII 마스킹 위치:**
 
 ```
-Phase 3:
-  chat.py에서 mask_pii(입력) → agent → mask_pii(출력)
-  ← 에이전트 경계 밖에서 처리
-
-Phase 4:
-  agent 내부에서 PIIMiddleware가 자동으로 처리
+agent 내부에서 PIIMiddleware가 자동으로 처리:
   apply_to_input=True:  HumanMessage에서 PII 제거 (checkpointer에도 마스킹된 버전 저장)
   apply_to_output=True: AIMessage에서 PII 제거
   ← 에이전트 경계 안에서 처리 (더 포괄적)
@@ -608,11 +483,10 @@ curl -X POST http://localhost:8000/chat \
 ## Phase 4 핵심 구조 요약
 
 ```
-[create_agent 마이그레이션]
-create_react_agent (legacy)     →  create_agent (현대 표준)
-  prompt=callable                   system_prompt=str + middleware=[]
-  InjectedStore+RunnableConfig      ToolRuntime[AgentContext]
-  config["configurable"]["user_id"] context=AgentContext(user_id=...)
+[create_agent 구성]
+  system_prompt=str + middleware=[]
+  ToolRuntime[AgentContext]
+  context=AgentContext(user_id=...) + config={thread_id}
 
 [PIIMiddleware 흐름]
 HumanMessage("카드 1234-5678-9012-3456")
@@ -646,19 +520,18 @@ agent.invoke() 완료
 - `from langchain.tools import ToolRuntime`이 공식 import 경로임을 이해
 
 ### agent/middleware.py
-- `InjectMemoryMiddleware`가 `make_inject_memory` 팩토리 패턴을 대체하는 이유 이해
 - `before_model(state, runtime)` 훅의 반환값 의미 이해 (None vs dict)
 - `is_blocked_input` 단락 패턴의 필요성 이해
 - `check_hallucination`이 search_contexts 있을 때만 호출되는 이유 이해
 
 ### agent/agent.py
-- `create_react_agent` vs `create_agent` 핵심 차이 이해
+- `create_agent`의 `middleware=[]` 파라미터 역할 이해
 - `PIIMiddleware` 커스텀 detector가 필요한 이유 이해 (한국어, 하이픈)
 - `context_schema=AgentContext`의 역할 이해
 
 ### routers/chat.py
-- `config`에서 `user_id`가 빠진 이유 이해 (`context=`로 분리됨)
-- PII 마스킹이 chat.py에서 사라진 이유 이해 (PIIMiddleware로 이동)
+- `user_id`가 `context=AgentContext(...)`로 전달되는 이유 이해
+- PII 마스킹이 chat.py에서 없는 이유 이해 (PIIMiddleware가 에이전트 내부 처리)
 - Before/After Guardrail의 실행 위치와 이유 이해
 
 ---

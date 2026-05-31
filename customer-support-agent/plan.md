@@ -229,7 +229,7 @@ SELECT cmetadata FROM langchain_pg_embedding LIMIT 3;
 |------|------|
 | `backend/agent/__init__.py` | 패키지 초기화 |
 | `backend/agent/tools.py` | `search_documents` Tool (Hybrid Search) |
-| `backend/agent/agent.py` | `create_react_agent` 설정 |
+| `backend/agent/agent.py` | `create_agent` 설정 |
 | `backend/api/chat.py` | POST /chat 엔드포인트 |
 | `backend/main.py` | FastAPI 진입점 + CORS + 라우터 등록 |
 
@@ -251,7 +251,7 @@ ensemble_retriever = EnsembleRetriever(
 
 **BM25 인덱스 관리**: 앱 시작 시 pgvector에서 전체 청크 로드 → BM25Retriever 생성. 새 문서 업로드 시 eager rebuild.
 
-**agent.py**: `langgraph.prebuilt.create_react_agent` + `ChatOpenAI(model="gpt-4o", temperature=0, streaming=True)`. 이 단계에서는 checkpointer/store 없이 기본 구성.
+**agent.py**: `langchain.agents.create_agent` + `ChatOpenAI(model="gpt-4o", temperature=0, streaming=True)`. 이 단계에서는 checkpointer/store 없이 기본 구성.
 
 **main.py**: FastAPI + CORS 미들웨어 (localhost:3000 + Vercel 허용) + 라우터 include.
 
@@ -302,15 +302,14 @@ store = InMemoryStore()           # user_id 기반 장기 기억
 
 | 파일 | 변경 |
 |------|------|
-| `backend/agent/agent.py` | **수정** - `create_react_agent` → `create_agent`, `PIIMiddleware` + `InjectMemoryMiddleware` 추가 |
+| `backend/agent/agent.py` | **수정** - `PIIMiddleware` + `InjectMemoryMiddleware` 추가 |
 | `backend/agent/middleware.py` | **수정** - `InjectMemoryMiddleware` 클래스 추가, `is_blocked_input`, `check_hallucination` 추가 |
 | `backend/agent/tools.py` | **수정** - `InjectedStore+RunnableConfig` → `ToolRuntime[AgentContext]` |
 | `backend/routers/chat.py` | **수정** - Before/After Guardrail 통합, `context=AgentContext(...)` 방식으로 변경 |
 
 ### 핵심 구현 포인트
 
-**create_agent 마이그레이션**:
-- `create_react_agent` (langgraph.prebuilt) → `create_agent` (langchain.agents): 공식 표준 에이전트
+**create_agent 구성**:
 - `middleware=[]` 파라미터로 `PIIMiddleware`, `InjectMemoryMiddleware` 연결
 - `context_schema=AgentContext` + `invoke(context=AgentContext(...))` 로 user_id 전달
 
@@ -397,7 +396,7 @@ def process_refund(order_id: str, amount: float, reason: str) -> str:
 현재 모듈 레벨 싱글톤 방식(`get_agent()`)을 FastAPI 권장 방식인 `app.state`로 전환.
 ```python
 # main.py lifespan에서 Agent 초기화
-app.state.agent = create_react_agent(...)
+app.state.agent = create_agent(...)
 
 # chat.py에서 Depends()로 주입
 def get_agent(req: Request):

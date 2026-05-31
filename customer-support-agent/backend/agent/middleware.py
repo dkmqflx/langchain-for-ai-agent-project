@@ -6,15 +6,10 @@ Phase 4: PIIMiddleware (langchain 내장), is_blocked_input, check_hallucination
 
 === create_agent 미들웨어 구조 ===
 
-create_react_agent (구):
-  prompt=make_inject_memory(_store)  ← callable로 동적 주입
-  InjectedStore + RunnableConfig     ← 도구에서 store/config 접근
-
-create_agent (신):
-  system_prompt=SYSTEM_PROMPT        ← 정적 문자열
-  middleware=[InjectMemoryMiddleware(), PIIMiddleware(...)]
-  context_schema=AgentContext        ← context로 user_id 전달
-  ToolRuntime[AgentContext]          ← 도구에서 store/context 접근
+system_prompt=SYSTEM_PROMPT        ← 정적 문자열
+middleware=[InjectMemoryMiddleware(), PIIMiddleware(...)]
+context_schema=AgentContext        ← context로 user_id 전달
+ToolRuntime[AgentContext]          ← 도구에서 store/context 접근
 
 === 미들웨어 실행 순서 ===
 

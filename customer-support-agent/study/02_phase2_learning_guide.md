@@ -308,13 +308,13 @@ ReAct는 먼저 확인하고 답변하므로 더 정확합니다.
 
 ---
 
-### 핵심 개념 2: create_react_agent 파라미터
+### 핵심 개념 2: Agent 설정 파라미터
 
 ```python
-_agent = create_react_agent(
-    model=_llm,                # [1] 어떤 AI 모델을 사용할지
-    tools=[search_documents],  # [2] 어떤 도구를 사용할 수 있는지
-    prompt=_SYSTEM_PROMPT,     # [3] AI에게 역할을 어떻게 부여할지
+_agent = create_agent(
+    model=_llm,                    # [1] 어떤 AI 모델을 사용할지
+    tools=[search_documents],      # [2] 어떤 도구를 사용할 수 있는지
+    system_prompt=SYSTEM_PROMPT,   # [3] AI에게 역할을 어떻게 부여할지
 )
 ```
 
@@ -340,10 +340,10 @@ tools=[search_documents, process_refund]
 #                        ↑ 환불 처리 도구 (관리자 승인 필요)
 ```
 
-**[3] prompt - AI에게 역할 부여**
+**[3] system_prompt - AI에게 역할 부여**
 
 ```python
-_SYSTEM_PROMPT = """당신은 B2B SaaS 고객 지원 에이전트입니다.
+SYSTEM_PROMPT = """당신은 B2B SaaS 고객 지원 에이전트입니다.
 - 답변은 반드시 업로드된 회사 문서를 기반으로 하세요.
 - 문서에 없는 내용은 "관련 정보를 문서에서 찾을 수 없습니다."라고 답변하세요.
 """
@@ -368,7 +368,7 @@ System Prompt 있음:
 ### 핵심 개념 3: Phase별 Agent 변화
 
 ```
-Phase 2: create_react_agent(model, tools, prompt)
+Phase 2: create_agent(model, tools, system_prompt)
           ↓ "대화를 기억 못 함"
           고객: "아까 말한 주문번호로 환불해줘"
           Agent: "아까 말씀하신 게 뭔가요?" (기억 없음)
@@ -728,7 +728,7 @@ chat.py → {"success": true, "data": {"response": "환불은 30일..."}}
 
 - ReAct 패턴 (Reasoning → Acting → Reasoning) 이해
 - temperature=0의 의미 이해
-- create_react_agent의 3가지 파라미터 역할 이해
+- Agent의 파라미터 역할 이해 (model, tools, system_prompt)
 - System Prompt가 없으면 어떤 문제가 생기는지 이해
 
 ### chat.py

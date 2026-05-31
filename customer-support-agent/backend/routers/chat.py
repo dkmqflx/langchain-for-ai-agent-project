@@ -1,19 +1,9 @@
 """
-Phase 4 수정: create_agent 마이그레이션 반영
+Before Guardrail → agent.invoke(context=AgentContext(user_id)) → After Guardrail
+PII 마스킹은 에이전트 내부 PIIMiddleware가 처리 (입력/출력 모두)
 
-파이프라인 변화 (create_react_agent → create_agent):
-  구:
-    입력 mask_pii() → Before Guardrail → agent.invoke(config={user_id}) → After Guardrail → 출력 mask_pii()
-
-  신:
-    Before Guardrail → agent.invoke(context=AgentContext(user_id)) → After Guardrail
-    PII 마스킹은 에이전트 내부 PIIMiddleware가 처리 (입력/출력 모두)
-
-user_id 전달 방식 변화:
-  구: config={"configurable": {"thread_id": ..., "user_id": ...}}
-  신: config={"configurable": {"thread_id": ...}}, context=AgentContext(user_id=...)
-  thread_id는 checkpointer용으로 여전히 config["configurable"]에 전달.
-  user_id는 context_schema=AgentContext로 선언된 AgentContext를 통해 전달.
+user_id는 context_schema=AgentContext로 선언된 AgentContext를 통해 전달.
+thread_id는 checkpointer용으로 config["configurable"]에 전달.
 """
 
 from langchain_core.messages import ToolMessage

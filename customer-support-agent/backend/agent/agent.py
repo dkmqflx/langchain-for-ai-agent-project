@@ -1,17 +1,4 @@
 """
-Phase 4 수정: create_react_agent → create_agent
-
-create_react_agent (구):
-  - prompt=callable로 동적 system prompt 주입
-  - InjectedStore + RunnableConfig으로 도구에서 store/config 접근
-  - middleware 파라미터 없음 → PIIMiddleware 사용 불가
-
-create_agent (신):
-  - system_prompt=정적 문자열, 동적 주입은 middleware로
-  - ToolRuntime[AgentContext]로 도구에서 store/context 접근
-  - middleware=[] 파라미터로 PIIMiddleware 등 공식 미들웨어 사용 가능
-  - context_schema=AgentContext → invoke 시 context=AgentContext(...) 전달
-
 미들웨어 실행 순서 (에이전트 내부):
   before_model 순서: InjectMemoryMiddleware → PIIMiddleware(email) → PIIMiddleware(card)
   after_model 순서:  PIIMiddleware(card) → PIIMiddleware(email) → InjectMemoryMiddleware(없음)

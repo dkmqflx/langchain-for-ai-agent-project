@@ -119,18 +119,9 @@ class AgentContext:
 
 ---
 
-### 핵심 개념 1: Phase 2 vs Phase 3 prompt 방식 비교
+### 핵심 개념 1: 동적 system prompt 주입
 
-**Phase 2 - 고정 문자열:**
-
-```python
-# agent.py
-_agent = create_react_agent(
-    model=_llm,
-    tools=[search_documents],
-    prompt="당신은 고객 지원 에이전트입니다.",   # ← 고정 문자열
-)
-```
+Phase 2까지는 모든 사용자에게 동일한 system prompt가 전달됩니다.
 
 ```
 모든 사용자에게 동일한 prompt:
@@ -140,19 +131,10 @@ _agent = create_react_agent(
   (선호도 반영 불가)
 ```
 
-**Phase 3 - callable:**
-
-```python
-# agent.py
-_agent = create_react_agent(
-    model=_llm,
-    tools=[...],
-    prompt=make_inject_memory(_store),   # ← 함수를 넘김!
-)
-```
+Phase 3는 `InjectMemoryMiddleware`로 요청마다 사용자별 선호도를 system prompt에 동적으로 주입합니다.
 
 ```
-요청마다 inject_memory 호출 → 사용자별 다른 prompt:
+요청마다 선호도 조회 → 사용자별 다른 prompt:
   고객 A (language=한국어) → "...에이전트입니다.\n[선호도]\n- language: 한국어"
   고객 B (선호도 없음)     → "...에이전트입니다."
   고객 C (style=간결하게)  → "...에이전트입니다.\n[선호도]\n- style: 간결하게"
@@ -160,115 +142,60 @@ _agent = create_react_agent(
 
 ---
 
-### 핵심 개념 2: 팩토리 패턴 (make_inject_memory)
-
-왜 `inject_memory`를 바로 정의하지 않고 `make_inject_memory(store)`로 감싸는가?
-
-**문제: inject_memory가 store에 접근하고 싶다**
-
-```
-middleware.py 에 inject_memory 함수가 있는데
-store는 agent.py 에 있음
-
-"store를 어떻게 가져오지?"
-```
-
-**방법 1 시도 (실패):**
+### 핵심 개념 2: InjectMemoryMiddleware 내부 동작
 
 ```python
-# middleware.py
-from agent.agent import _store  # agent.py에서 가져오려고 시도
-
-# agent.py
-from agent.middleware import inject_memory  # middleware.py에서 가져오려고 시도
-```
-
-```
-middleware.py → "agent.py 줘!"
-agent.py      → "middleware.py 줘!"
-middleware.py → "agent.py 줘!"
-...무한 루프 💀
-```
-
-**방법 2 (현재 방식): "store를 선물로 받자"**
-
-```python
-# agent.py
-_store = InMemoryStore()              # store는 내가 만들고
-make_inject_memory(_store)            # 선물로 건네줌
-```
-
-```python
-# middleware.py
-def make_inject_memory(store):        # 선물 받는 함수
-    def inject_memory(state, config):
-        items = store.search(...)     # 받은 선물 꺼내 씀
-    return inject_memory
-```
-
-```
-agent.py: "여기 store 선물이야" → middleware.py에게 전달
-middleware.py: "고마워, 잘 쓸게!" (import 없이도 OK!) ✅
-```
-
-**클로저 = "선물 보관함":**
-
-```
-make_inject_memory(_store) 호출
-     ↓
-inject_memory 함수 탄생
-이 함수 안에 store가 자동 보관됨
-
-나중에 inject_memory() 호출되면
-  → 보관된 store 꺼내서 사용 ✅
-```
-
----
-
-### 핵심 개념 3: inject_memory 내부 동작
-
-```python
-def inject_memory(state, config: RunnableConfig) -> list:
-    # [1] config에서 user_id 추출
-    user_id = config["configurable"].get("user_id", "anonymous")
-    
-    # [2] store에서 해당 사용자의 선호도 조회
-    namespace = ("user_preferences", user_id)
-    items = store.search(namespace)
-    
-    # [3] 선호도를 문자열로 변환
-    if items:
+class InjectMemoryMiddleware(AgentMiddleware):
+    def before_model(self, state, runtime: Runtime) -> dict | None:
+        # [1] runtime에서 user_id 추출
+        user_id = runtime.context.user_id
+        
+        # [2] store에서 해당 사용자의 선호도 조회
+        namespace = ("user_preferences", user_id)
+        items = runtime.store.search(namespace)
+        
+        if not items:
+            return None  # 선호도 없으면 변경 없음
+        
+        # [3] 선호도를 문자열로 변환
         preferences = "\n".join(
             f"- {item.key}: {item.value['value']}" for item in items
         )
         memory_text = f"\n\n[사용자 선호도 - 반드시 반영하세요]\n{preferences}"
-    
-    # [4] system prompt에 선호도 추가
-    system_content = SYSTEM_PROMPT + memory_text
-    
-    # [5] [SystemMessage] + [기존 대화 이력] 반환
-    return [SystemMessage(content=system_content)] + list(state["messages"])
+        
+        # [4] 기존 SystemMessage에 선호도 추가
+        messages = list(state["messages"])
+        for i, msg in enumerate(messages):
+            if isinstance(msg, SystemMessage):
+                messages[i] = SystemMessage(content=msg.content + memory_text)
+                return {"messages": messages}
+        
+        return None
 ```
 
-**반환값이 왜 `[SystemMessage] + messages`인가:**
+**before_model 반환값 의미:**
 
 ```
-LLM에 전달되는 메시지 구조:
-  [SystemMessage("당신은 에이전트입니다. 선호도: 한국어")]  ← inject_memory가 추가
-  [HumanMessage("안녕하세요")]                              ← 고객 질문
-  [AIMessage("안녕하세요! 무엇을 도와드릴까요?")]           ← 이전 답변
-  [HumanMessage("환불하고 싶어요")]                         ← 현재 질문
+None 반환:       state 변경 없음 (선호도 없을 때)
+dict 반환:       반환된 dict로 state 업데이트
+                 {"messages": [...]} → 메시지 목록을 교체
 ```
 
-SystemMessage가 항상 맨 앞에 있어야 LLM이 역할을 정확히 인식합니다.
+**namespace가 tuple인 이유:**
+
+```
+LangGraph Store는 계층적 네임스페이스 지원.
+("user_preferences", "cust-001") → 그룹="user_preferences" > 사용자="cust-001"
+나중에 ("conversation_history", "cust-001") 같은 다른 그룹도 추가 가능.
+```
 
 ---
 
 ### 학습 질문
 
-- make_inject_memory 대신 inject_memory를 직접 정의하면 어떤 에러가 날까?
-- items가 빈 리스트일 때 memory_text는 어떻게 되는가?
+- items가 빈 리스트일 때 어떤 값이 반환되는가?
 - `store.search(namespace)`에서 namespace가 tuple인 이유는 무엇일까?
+- `before_model`이 `None`을 반환할 때와 `{"messages": [...]}`를 반환할 때의 차이는?
 
 ---
 
@@ -401,7 +328,7 @@ checkpointer와 store가 무엇인지, 왜 싱글톤이어야 하는지 이해
 ```python
 _checkpointer = InMemorySaver()
 
-_agent = create_react_agent(
+_agent = create_agent(
     ...
     checkpointer=_checkpointer,
 )
@@ -450,7 +377,7 @@ thread_id="sess-B":
 ```python
 _store = InMemoryStore()
 
-_agent = create_react_agent(
+_agent = create_agent(
     ...
     store=_store,
 )
@@ -494,7 +421,7 @@ def get_agent():
 def get_agent():
     checkpointer = InMemorySaver()   # 매번 새로 만들면
     store = InMemoryStore()          # 이전에 저장된 내용이 사라짐!
-    return create_react_agent(...)
+    return create_agent(...)
 ```
 
 ```
@@ -513,23 +440,25 @@ def get_agent():
 
 ---
 
-### 핵심 개념 4: Phase별 create_react_agent 변화
+### 핵심 개념 4: Phase별 Agent 변화
 
 ```
 Phase 2:
-  create_react_agent(
+  create_agent(
       model=_llm,
       tools=[search_documents],
-      prompt="고정 문자열",
+      system_prompt="고정 문자열",
   )
 
 Phase 3:
-  create_react_agent(
+  create_agent(
       model=_llm,
       tools=[search_documents, save_user_preference, get_user_preferences],
-      prompt=make_inject_memory(_store),  # ← callable로 변경
-      checkpointer=_checkpointer,         # ← 단기 기억 추가
-      store=_store,                       # ← 장기 기억 추가
+      system_prompt=SYSTEM_PROMPT,
+      middleware=[InjectMemoryMiddleware()],  # ← 장기 기억 동적 주입
+      checkpointer=_checkpointer,            # ← 단기 기억 추가
+      store=_store,                          # ← 장기 기억 추가
+      context_schema=AgentContext,
   )
 
 Phase 5: + process_refund tool
@@ -707,9 +636,8 @@ Agent가 한국어로 답변 (고객이 다시 요청 안 해도!)
 - user_tier 필드가 지금 당장은 안 쓰이는데 왜 있는지 이해
 
 ### middleware.py
-- make_inject_memory가 팩토리 패턴인 이유 (순환 import 방지) 이해
-- 클로저(closure)가 store를 어떻게 캡처하는지 이해
-- inject_memory 반환값이 `[SystemMessage] + messages`인 이유 이해
+- `InjectMemoryMiddleware.before_model` 훅의 반환값 의미 이해 (None vs dict)
+- 기존 SystemMessage에 선호도를 덧붙이는 방식 이해
 - namespace가 `("user_preferences", user_id)` tuple인 이유 이해
 
 ### tools.py
@@ -721,7 +649,6 @@ Agent가 한국어로 답변 (고객이 다시 요청 안 해도!)
 ### agent.py
 - InMemorySaver(단기) vs InMemoryStore(장기) 차이 이해
 - 싱글톤이 필수인 이유 이해 (요청마다 새로 만들면 상태 유실)
-- prompt를 문자열 → callable로 바꾼 이유 이해
 - Phase 2 → Phase 3 변화 요약 이해
 
 ### routers/chat.py
@@ -754,12 +681,7 @@ Production 전환 (Phase 7):
 
 Phase 3을 완료했으면:
 
-- **Phase 4**: PII + Guardrail Middleware + `create_agent` 마이그레이션
-  - `create_react_agent` → `create_agent` (LangChain 공식 표준 에이전트)
-    - `middleware=[]` 파라미터 지원 → `PIIMiddleware` 등 공식 미들웨어 사용 가능
-    - `context_schema=AgentContext` → user_id를 `config` 대신 `context=` 로 전달
-    - 도구의 `InjectedStore + RunnableConfig` → `ToolRuntime[AgentContext]`
-    - `make_inject_memory` callable → `InjectMemoryMiddleware` 클래스
+- **Phase 4**: PII + Guardrail Middleware
   - PII 마스킹: `PIIMiddleware` (langchain 내장) + 커스텀 detector
     예) "내 이메일은 test@test.com이에요" → "[REDACTED_EMAIL]"
   - Before Guardrail: 키워드 기반 욕설 차단 (`is_blocked_input`)
