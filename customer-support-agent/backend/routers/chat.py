@@ -7,7 +7,7 @@ thread_id는 checkpointer용으로 config["configurable"]에 전달.
 """
 
 from langchain_core.messages import ToolMessage
-from langgraph.types import Command
+from langgraph.types import Command  # interrupt된 그래프를 재개할 때 사용
 from fastapi import APIRouter, HTTPException
 
 from agent.agent import get_agent
@@ -68,9 +68,28 @@ async def chat(request: ChatRequest):
         #
         # 여기서는 관리자 큐에 저장하지 않는다. interrupt 상태는 checkpointer(thread_id)가
         # 들고 있고, 사용자가 /chat/confirm으로 확인/취소하면 그때 재개된다.
+        # interrupts 구조:
+        # [
+        #   Interrupt(
+        #     value={
+        #       "action_requests": [
+        #         {
+        #           "name": "submit_refund_request",
+        #           "args": {"order_id": "ORD-123", "amount": 50000, "reason": "불량"},
+        #           "description": "도구 설명"
+        #         }
+        #       ],
+        #       "review_configs": [...]
+        #     }
+        #   )
+        # ]
         interrupts = result.get("__interrupt__")
         if interrupts:
-            # interrupt value = HITLRequest {"action_requests": [...], "review_configs": [...]}
+            # interrupts[0].value["action_requests"][0] 접근 흐름:
+            #   interrupts[0]                         → Interrupt 객체
+            #   .value                                → HITLRequest 딕셔너리
+            #   ["action_requests"]                   → action 리스트
+            #   [0]                                   → 첫 번째 action 딕셔너리
             action = interrupts[0].value["action_requests"][0]
             return {
                 "success": True,
@@ -145,6 +164,14 @@ async def confirm(request: ConfirmRequest):
     """
     try:
         agent = get_agent()
+        # Command(resume=...): interrupt된 에이전트를 재개
+        # - resume: 멈춘 지점부터 다시 시작
+        # - decisions: HumanInTheLoopMiddleware로 사용자의 선택 전달
+        #   ├─ "approve": submit_refund_request 실행 → 신청 접수
+        #   └─ "reject": 도구 건너뜀 → 신청하지 않음
+        #
+        # thread_id: 멈춘 상태를 checkpointer에서 조회 (어느 대화에서 멈췄는지)
+        # context: user_id 다시 전달 (inject_memory + tool에서 사용)
         result = await agent.ainvoke(
             Command(resume={"decisions": [{"type": request.decision}]}),
             config={"configurable": {"thread_id": request.thread_id}},

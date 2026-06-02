@@ -6,20 +6,9 @@
 
 ## Phase 5에서 새로 추가된 것
 
-Phase 4까지는 에이전트가 **모든 작업을 혼자 끝까지** 처리했습니다.
-
-```
-[Phase 4 문제]
-
-고객: "주문 ORD-123, 5만원 환불해줘"
-Agent: "네, 환불 처리했습니다!" ← 아무 확인 없이 바로 돈이 나감 💸
-```
-
 Phase 5는 환불 같은 **민감한 작업에 두 단계의 사람 개입**을 넣습니다.
 
 ```
-[Phase 5 해결]
-
 ① 고객 본인 확인 (즉시)
    고객: "ORD-123 5만원 환불해줘"
    Agent: "정말 환불 신청할까요?" ⏸️
@@ -33,44 +22,8 @@ Phase 5는 환불 같은 **민감한 작업에 두 단계의 사람 개입**을 
    고객: 마이페이지에서 "rf-1: 승인됨" 확인
 ```
 
----
+Phase 5는 두 승인을 **분리**합니다:
 
-## ⭐ 가장 중요한 설계 결정: "사람"이 둘이다
-
-처음에 흔히 빠지는 함정이 있습니다:
-
-```
-[잘못된 설계] 관리자 승인을 "그 자리에서" 기다리게 함
-
-고객: "환불해줘" → 에이전트 일시정지 → (관리자 올 때까지...) → 응답
-                                          ↑
-                        관리자는 실시간으로 채팅을 안 보고 있다!
-                        고객이 몇 시간을 기다려야 할 수도 있음 ❌
-```
-
-핵심 통찰: 환불에는 **성격이 다른 두 개의 "승인"** 이 있습니다.
-
-| 구분 | 누가 | 언제 | 방식 |
-|------|------|------|------|
-| **본인 확인** | 고객 자신 | 즉시 (채팅 중) | 동기 — "정말 신청?" |
-| **업무 승인** | 관리자 | 나중에 | **비동기** — 백오피스 검토 |
-
-그리고 또 하나: **"환불 신청 접수"는 위험한 작업이 아닙니다.** 그냥 신청서 한 장을 접수하는 것뿐이죠 (status=pending). 실제로 돈이 나가는 건 관리자가 승인할 때입니다.
-
-**비유: 회사 휴가 신청**
-
-```
-직원이 휴가 신청서를 낸다 (신청 접수 = 안 위험함)
-  → "정말 이 날짜로 낼까요?" 본인이 한 번 확인 (즉시)
-  → 신청서 제출됨 (대기 상태)
-팀장이 나중에 결재한다 (승인/반려 = 비동기)
-직원은 나중에 결재 결과를 확인한다
-
-직원이 신청서 내자마자 팀장 자리로 달려가
-"지금 당장 결재해주세요" 하고 서 있는 건 말이 안 된다.
-```
-
-그래서 Phase 5는 둘을 **분리**합니다:
 - **본인 확인** = LangGraph interrupt/resume (채팅 안에서 즉시)
 - **관리자 승인** = 별도 저장소(refund_store) + 관리자 엔드포인트 (LangGraph와 무관)
 
@@ -221,7 +174,7 @@ set_decision(refund_id, decision)                  # 관리자 결정 반영
 
 ---
 
-### 핵심 개념: 이름이 곧 의도다 (process_refund ❌ → submit_refund_request ✅)
+### 핵심 개념: 도구의 역할
 
 ```python
 @tool
@@ -239,11 +192,6 @@ def submit_refund_request(
 
 이 도구는 **돈을 움직이지 않습니다.** `create_request`로 신청 레코드(pending)를 하나 만들 뿐입니다.
 
-```
-process_refund (이전): "환불이 완료되었습니다" ← 이미 돈이 나간 것처럼
-submit_refund_request : "환불 신청이 접수되었습니다" ← 신청서만 접수
-```
-
 `runtime.context.user_id`로 **누가** 신청했는지 기록합니다. 이게 있어야 나중에 그 사용자가 `GET /refunds`로 본인 신청을 조회할 수 있습니다.
 
 ---
@@ -255,11 +203,11 @@ submit_refund_request : "환불 신청이 접수되었습니다" ← 신청서�
 
 ---
 
-## Step 3: `agent/agent.py` 읽기 — 본인 확인용 HITL (15분)
+## Step 3: `agent/agent.py` 읽기 — HITL 설정 (15분)
 
 ### 목표
 
-HITL interrupt를 "관리자"가 아니라 "사용자 본인" 확인에 쓰는 이유를 이해
+`HumanInTheLoopMiddleware`의 `interrupt_on` 설정과 동작 방식 이해
 
 ---
 
@@ -279,8 +227,7 @@ middleware=[
 ]
 ```
 
-`interrupt_on`에 등록된 도구는 **실행 직전에 멈춥니다.** 여기서 멈춰서 받는 확인은
-**사용자 본인**의 확인입니다 (관리자 아님):
+`interrupt_on`에 등록된 도구는 **실행 직전에 멈춥니다.**
 
 ```
 모델: "submit_refund_request(ORD-123, 50000, 불량) 호출할게"
@@ -292,24 +239,13 @@ chat.py가 "정말 신청할까요?"를 사용자에게 물어봄
 사용자가 /chat/confirm으로 approve/reject ▶️
 ```
 
-**왜 사용자 본인 확인에 쓰나?**
-
-```
-사용자는 지금 채팅창 앞에 있다 → 즉시 답한다 → 빨리 재개된다 ✅
-관리자는 채팅을 안 보고 있다 → interrupt로 기다리면 무한정 대기 ❌
-
-→ interrupt(동기 일시정지)는 "그 자리에 있는 사람"인 사용자에게만 적합.
-   관리자(자리에 없음)는 비동기 저장소로 처리 (Step 5).
-```
-
-> 참고: interrupt가 동작하려면 `checkpointer`가 필수인데, Phase 3에서 추가한
+> interrupt가 동작하려면 `checkpointer`가 필수인데, Phase 3에서 추가한
 > `InMemorySaver`가 그대로 쓰입니다.
 
 ---
 
 ### 학습 질문
 
-- 관리자 승인을 interrupt로 처리하면 어떤 문제가 생길까?
 - `interrupt_on`에서 `submit_refund_request`를 빼면 어떻게 동작이 바뀔까?
 
 ---
@@ -383,18 +319,6 @@ reject  → 도구 건너뜀 → 레코드 안 생김 → "cancelled"
   → inject_memory가 user_id로 선호도를 주입하고,
   → submit_refund_request 도구가 user_id로 신청자를 기록한다.
 그래서 /chat/confirm 요청에 user_id를 포함해 context로 다시 전달한다.
-```
-
-**비유: 식당에서 주문 재확인**
-
-```
-손님: "이 메뉴 매운맛으로 주세요"
-점원: "매운맛 확실하세요?" ⏸️ (확인)
-손님: "네" ▶️
-점원: 주방에 주문 넣음 (신청 접수)
-
-점원이 손님에게 확인받는 것 = /chat/confirm
-주방이 요리하는 것(나중) = 관리자 승인
 ```
 
 ---
@@ -566,8 +490,8 @@ POST /approve {refund_id, decision} → set_decision() → status 변경
 [③ 사용자 조회 — 마이페이지]
 GET /refunds?user_id → list_by_user() → 내 신청 상태 목록
 
-핵심: interrupt(동기)는 "그 자리에 있는 사용자" 확인에만,
-      관리자 승인(비동기)은 refund_store CRUD로 분리.
+핵심: 본인 확인(interrupt) = LangGraph 재개,
+      관리자 승인 = refund_store CRUD (LangGraph 무관).
 ```
 
 ---
@@ -575,24 +499,29 @@ GET /refunds?user_id → list_by_user() → 내 신청 상태 목록
 ## 검증 체크리스트
 
 ### refund_store.py
+
 - checkpointer(대화 상태)와 refund_store(신청 레코드)의 차이 이해
 - 레코드가 본인 확인 "후"에 생성되는 점 이해
 - status 생애주기(pending → approved/rejected) 이해
 
 ### tools.py
+
 - submit_refund_request가 "환불 실행"이 아니라 "신청 접수"임을 이해
 - runtime.context.user_id로 신청자를 기록하는 이유 이해
 
 ### agent.py
-- HITL interrupt를 "사용자 본인 확인"에 쓰는 이유 이해
-- 관리자 승인을 interrupt로 처리하면 안 되는 이유 이해
+
+- `interrupt_on`에 도구 이름을 등록하면 실행 직전에 멈추는 동작 이해
 
 ### routers/chat.py
+
 - `result.get("__interrupt__")`를 messages[-1]보다 먼저 검사하는 이유 이해
 - /chat/confirm이 Command(resume=...)로 재개하는 방법 이해
 - 재개 시 context(user_id)를 다시 넘기는 이유 이해
 
 ### routers/refund.py
+
 - 관리자 승인이 LangGraph 재개가 아니라 레코드 상태 변경인 점 이해
 - thread_id(대화)와 refund_id(신청서)의 차이 이해
 - GET /refunds로 사용자가 비동기 결과를 확인하는 흐름 이해
+
