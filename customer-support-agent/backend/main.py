@@ -73,6 +73,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",   # Next.js 로컬 개발 서버
+        "http://localhost:3001",   # Next.js 로컬 개발 서버 (3000 점유 시 대체 포트)
         "https://*.vercel.app",    # Vercel 배포 프론트엔드
     ],
     allow_credentials=True,
