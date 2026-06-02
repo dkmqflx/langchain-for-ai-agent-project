@@ -6,6 +6,7 @@ requires-python = ">=3.14"
 dependencies = [
     "fastapi>=0.115.0",
     "langchain>=0.3.0",
+    "langchain-classic>=1.0.7",
     "langchain-openai>=0.2.0",
     "langchain-postgres>=0.0.12",
     "langgraph>=0.2.50",
@@ -20,3 +21,12 @@ dependencies = [
     "sse-starlette>=2.0.0",
     "uvicorn[standard]>=0.30.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
