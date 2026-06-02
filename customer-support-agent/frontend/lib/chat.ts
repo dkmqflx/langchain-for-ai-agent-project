@@ -46,8 +46,9 @@ export async function streamChat(
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
-    // SSE 이벤트는 빈 줄(\n\n)로 구분
-    const blocks = buffer.split("\n\n");
+    // SSE 이벤트는 빈 줄로 구분. sse-starlette는 CRLF(\r\n)를 쓰므로
+    // 구분자가 "\r\n\r\n"이다. LF 전용("\n\n") 환경도 함께 처리.
+    const blocks = buffer.split(/\r\n\r\n|\n\n/);
     buffer = blocks.pop() ?? ""; // 마지막 미완성 블록은 보관
     for (const block of blocks) {
       if (!block.trim()) continue;
