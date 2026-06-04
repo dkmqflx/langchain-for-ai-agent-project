@@ -23,6 +23,7 @@ from agent.refund_store import (
     list_pending,
     set_decision,
 )
+from models.common import ErrorResponse
 from models.refund import AdminDecisionRequest
 
 router = APIRouter(tags=["Refunds"])
@@ -54,7 +55,14 @@ async def list_pending_refunds():
     }
 
 
-@router.post("/approve")
+@router.post(
+    "/approve",
+    responses={
+        400: {"model": ErrorResponse, "description": "이미 처리된 신청"},
+        404: {"model": ErrorResponse, "description": "신청번호를 찾을 수 없음"},
+        422: {"model": ErrorResponse, "description": "요청 검증 실패 (refund_id/decision 누락 등)"},
+    },
+)
 async def decide_refund(request: AdminDecisionRequest):
     """
     (관리자) 환불 신청을 승인 또는 거절한다.
@@ -80,7 +88,12 @@ async def decide_refund(request: AdminDecisionRequest):
     }
 
 
-@router.get("/refunds")
+@router.get(
+    "/refunds",
+    responses={
+        422: {"model": ErrorResponse, "description": "요청 검증 실패 (user_id 누락 등)"},
+    },
+)
 async def my_refunds(user_id: str):
     """(사용자) 본인이 신청한 환불 목록과 상태를 조회한다 (마이페이지용)."""
     refunds = [_to_item(r) for r in list_by_user(user_id)]

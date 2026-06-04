@@ -27,11 +27,19 @@ from models.chat import (
     ConfirmRequest,
     ConfirmResponse,
 )
+from models.common import ErrorResponse
 
 router = APIRouter(tags=["Chat"])
 
 
-@router.post("/chat", response_model=ChatResponse)
+@router.post(
+    "/chat",
+    response_model=ChatResponse,
+    responses={
+        422: {"model": ErrorResponse, "description": "요청 검증 실패 (message 누락 등)"},
+        500: {"model": ErrorResponse, "description": "에이전트 처리 중 오류"},
+    },
+)
 async def chat(request: ChatRequest):
     """
     고객 메시지를 미들웨어 파이프라인을 통해 처리하고 안전한 답변을 반환.
@@ -155,7 +163,14 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/chat/confirm", response_model=ConfirmResponse)
+@router.post(
+    "/chat/confirm",
+    response_model=ConfirmResponse,
+    responses={
+        422: {"model": ErrorResponse, "description": "요청 검증 실패 (thread_id/decision 누락 등)"},
+        500: {"model": ErrorResponse, "description": "에이전트 재개 중 오류"},
+    },
+)
 async def confirm(request: ConfirmRequest):
     """
     사용자 본인이 환불 신청을 확인(approve)하거나 취소(reject)하여 에이전트를 재개한다.
@@ -230,7 +245,11 @@ async def confirm(request: ConfirmRequest):
                     }
                 }
             },
-        }
+        },
+        422: {
+            "model": ErrorResponse,
+            "description": "요청 검증 실패 (message 누락 등). 스트림 시작 전 발생.",
+        },
     },
 )
 async def chat_stream(request: ChatRequest):
