@@ -25,7 +25,7 @@ from agent.refund_store import (
 )
 from models.refund import AdminDecisionRequest
 
-router = APIRouter()
+router = APIRouter(tags=["Refunds"])
 
 
 def _to_item(req: RefundRequest) -> dict:

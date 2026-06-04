@@ -23,7 +23,7 @@ from agent.streaming import (
 )
 from models.chat import ChatRequest, ConfirmRequest
 
-router = APIRouter()
+router = APIRouter(tags=["Chat"])
 
 
 @router.post("/chat")

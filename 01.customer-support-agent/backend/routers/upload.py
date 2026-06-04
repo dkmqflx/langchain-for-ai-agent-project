@@ -40,7 +40,7 @@ from rag.vectorstore import add_documents, vectorstore
 
 # APIRouter: FastAPI에서 라우트 그룹화
 # main.py에서 app.include_router(router)로 등록됨
-router = APIRouter()
+router = APIRouter(tags=["Documents"])
 
 # 지원하는 파일 확장자
 ALLOWED_EXTENSIONS = {".pdf", ".txt"}

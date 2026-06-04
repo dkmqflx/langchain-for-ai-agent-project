@@ -104,7 +104,7 @@ app.include_router(chat_router)
 app.include_router(refund_router)
 
 
-@app.get("/health")
+@app.get("/health", tags=["Health"])
 async def health():
     """서버 상태 확인 엔드포인트."""
     return {"status": "ok"}
