@@ -700,5 +700,5 @@ Phase 3을 완료했으면:
 - **Phase 4**: PII + Guardrail Middleware
   - PII 마스킹: `PIIMiddleware` (langchain 내장) + 커스텀 detector
     예) "내 이메일은 test@test.com이에요" → "[REDACTED_EMAIL]"
-  - Before Guardrail: 키워드 기반 욕설 차단 (`is_blocked_input`)
+  - Before Guardrail: 키워드 기반 욕설 차단 (`@before_agent` 미들웨어 `block_inappropriate_input`)
   - After Guardrail: GPT-4o-mini가 답변 검증 (`check_hallucination`)

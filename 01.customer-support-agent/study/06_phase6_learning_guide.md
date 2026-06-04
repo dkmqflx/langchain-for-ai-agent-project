@@ -142,9 +142,9 @@ frontend/app/page.tsx       → 채팅 UI (스트리밍 소비)
 
 브라우저: POST /chat/stream {"message", "thread_id", "user_id"}
   ↓ (연결 유지)
-백엔드: Before Guardrail 검사
-  ↓
 백엔드: agent.astream(stream_mode=["updates","messages"]) 관찰
+        (Before Guardrail은 에이전트 내부 before_agent 미들웨어가 담당 →
+         updates 스트림에서 blocked 신호 감지)
   ↓
   ├── 욕설 → event:blocked → 연결 종료
   ├── 일반 토큰 → event:token (여러 번) → event:done
@@ -758,10 +758,10 @@ npm run dev
 
 입력: {message, thread_id, user_id}
   ↓
-① Before Guardrail (차단?) → event:blocked → 종료
-  ↓
-② agent.astream(stream_mode=["updates","messages"]) 루프
-   updates 모드 → extract_interrupt_action → 발견하면 break
+agent.astream(stream_mode=["updates","messages"]) 루프
+   updates 모드 → extract_block_reason → 욕설 차단 발견하면 break (event:blocked)
+                  (Before Guardrail은 에이전트 내부 before_agent 미들웨어가 단락)
+                  extract_interrupt_action → 발견하면 break
    messages 모드 → is_search_tool_result → used_search=True
                    is_final_answer_chunk →
                      used_search=False → event:token (즉시)

@@ -29,8 +29,8 @@ PIIMiddleware (에이전트 내부):
   "내 카드 1234-5678-9012-3456..." → "내 카드 ****-****-****-3456..."
   "이메일 a@b.com 이에요" → "[REDACTED_EMAIL] 이에요"
 
-Before Guardrail (에이전트 실행 전):
-  "씨발 환불해줘" → "부적절한 언어가..." (에이전트 실행 없음, 비용 절약)
+Before Guardrail (에이전트 내부 before_agent 미들웨어, 진입 시 1회):
+  "씨발 환불해줘" → "부적절한 언어가..." (모델 호출 없이 jump_to="end"로 단락, 비용 절약)
 
 After Guardrail (에이전트 실행 후):
   Agent: "환불은 7일 이내 가능합니다"
@@ -46,32 +46,41 @@ After Guardrail (에이전트 실행 후):
 [수정된 파일]
 agent/context.py    → 변경 없음
 agent/tools.py      → InjectedStore+RunnableConfig → ToolRuntime[AgentContext]
-agent/middleware.py → inject_memory (@wrap_model_call 함수), is_blocked_input, check_hallucination 추가
-agent/agent.py      → PIIMiddleware + middleware=[] 추가
+agent/middleware.py → inject_memory (@wrap_model_call 함수), block_inappropriate_input
+                      (@before_agent 가드레일, is_blocked_input 호출), check_hallucination 추가
+agent/agent.py      → PIIMiddleware + middleware=[] 추가 (block_inappropriate_input 맨 앞)
 routers/chat.py     → Before/After Guardrail 통합, context= 방식으로 변경
 
 [요청 처리 파이프라인]
 POST /chat {"message": "씨발 환불해줘", "user_id": "cust-001", "thread_id": "..."}
      ↓
-[1] is_blocked_input(message)       → 욕설 감지 → 즉시 반환 (에이전트 미실행)
-     ↓ (차단 안 됨)
-[2] agent.invoke(
+[1] agent.invoke(
       context=AgentContext(user_id)  → inject_memory가 사용 (장기 기억)
       config={thread_id}             → checkpointer가 사용 (단기 기억)
     )
      ┌─ 에이전트 내부 ─────────────────────────────────────────┐
+     │  block_inappropriate_input.before_agent → 욕설이면 모델   │
+     │      호출 없이 jump_to="end" 단락 + state["blocked"]=True │
      │  PIIMiddleware.before_model         → 입력 PII 마스킹      │
      │  inject_memory (wrap_model_call)    → system prompt 주입  │
      │  ---- 모델 호출 (handler) ----                            │
      │  PIIMiddleware.after_model          → 출력 PII 마스킹      │
      └──────────────────────────────────────────────────────────┘
      ↓
+[2] result["blocked"]?              → True면 status="blocked"로 즉시 반환
+     ↓ (차단 안 됨)
 [3] ToolMessage 분석 → search_documents 결과 수집
      ↓
 [4] check_hallucination(...) → 컨텍스트 있을 때만 GPT-4o-mini 검증
      ↓
 응답 반환
 ```
+
+> 참고(히스토리): 초기 구현은 라우터(chat.py)에서 `is_blocked_input(request.message)`를
+> 직접 호출해 에이전트 실행 *전*에 단락했다. 현재는 공식 권장 방식대로 `@before_agent`
+> 미들웨어(`block_inappropriate_input`)로 옮겨, `/chat`·`/chat/stream` 모든 진입점에
+> 자동 적용되고 라우터 중복이 사라졌다. 순수 키워드 스캔 로직은 테스트 용이하게
+> `is_blocked_input` 함수로 남겨 미들웨어가 호출한다.
 
 ---
 
@@ -242,7 +251,7 @@ wrap_model_call: 그 모델 호출에만 적용되는 system_prompt를 override
 
 이 두 함수는 Phase 3→4 마이그레이션과 무관하게 새로 추가된 순수 안전 기능입니다.
 
-**is_blocked_input — 에이전트 실행 전 단락(short-circuit)**:
+**is_blocked_input — 순수 스캔 함수 (before_agent 미들웨어가 호출)**:
 
 ```python
 def is_blocked_input(text: str) -> tuple[bool, str]:
@@ -253,7 +262,13 @@ def is_blocked_input(text: str) -> tuple[bool, str]:
     return False, ""
 ```
 
-`(bool, reason)` tuple을 반환하는 이유: `if blocked: return {"response": reason}` 처럼 거절 메시지도 함께 전달하기 위해.
+`(bool, reason)` tuple을 반환하는 이유: 차단 여부와 거절 메시지를 함께 넘겨,
+미들웨어가 `block_reason`으로 state에 담아 라우터까지 전달하기 위해.
+
+이 함수는 네트워크·상태가 없어 단위 테스트가 쉽다. 실제 단락(short-circuit)은
+이를 호출하는 `@before_agent` 미들웨어 `block_inappropriate_input`이 담당한다.
+욕설이면 `{"jump_to": "end", "blocked": True, "block_reason": reason, "messages": [...]}`을
+반환해 모델 호출 없이 에이전트를 종료시킨다.
 
 **check_hallucination — 에이전트 실행 후 검증**:
 
@@ -388,17 +403,16 @@ Phase 3→4 파이프라인 변화, context= 전달 방식 이해
 ### 핵심 개념: chat.py 파이프라인
 
 ```python
-# [1] Before Guardrail
-blocked, reason = is_blocked_input(request.message)
-if blocked:
-    return {..., "status": "blocked"}
-
-# [2] Agent 실행
+# [1] Agent 실행 (Before Guardrail은 내부 before_agent 미들웨어가 담당)
 result = await agent.ainvoke(
     {"messages": [("human", request.message)]},
     config={"configurable": {"thread_id": request.thread_id}},  # thread_id만
     context=AgentContext(user_id=request.user_id),               # user_id는 context로
 )
+
+# [2] Before Guardrail 차단 감지 (미들웨어가 state에 남긴 신호)
+if result.get("blocked"):
+    return {..., "response": result.get("block_reason", ""), "status": "blocked"}
 
 # [3] 검색 컨텍스트 추출 + [4] After Guardrail
 search_contexts = [
@@ -423,7 +437,7 @@ agent 내부에서 PIIMiddleware가 자동으로 처리:
 ### 학습 질문
 
 - Phase 4에서는 `request.message`를 마스킹 없이 그대로 agent에 넘기는데, PII가 안전한 이유는?
-- `is_blocked_input`이 `request.message`에 적용되는 것이 맞는가? 마스킹 후에 적용해야 하지 않는가?
+- Before Guardrail을 라우터 선검사가 아니라 `@before_agent` 미들웨어로 둘 때의 장단점은? (모든 진입점 자동 적용 vs. 차단이어도 에이전트가 일단 시작되는 비용)
 - `search_contexts`가 빈 리스트일 때 After Guardrail을 건너뛰는 이유는?
 
 ---
@@ -517,8 +531,9 @@ AIMessage("카드 ****-****-****-3456으로...")  ← 이미 마스킹됨
   → 응답
 
 [Before Guardrail 흐름]
-입력 → is_blocked_input() → 욕설?
-  YES → 즉시 "blocked" 반환 (agent.invoke() 호출 없음)
+agent.invoke() → block_inappropriate_input.before_agent → is_blocked_input() → 욕설?
+  YES → jump_to="end" 단락 + state["blocked"]=True (모델 호출 없음)
+        → 라우터가 result["blocked"] 보고 "blocked" 반환
   NO  → 계속
 
 [After Guardrail 흐름]
@@ -542,7 +557,7 @@ agent.invoke() 완료
 - `inject_memory`의 `(request, handler)` wrap_model_call 패턴 이해
 - `async def` + `await handler(request)`가 필요한 이유 이해 (ainvoke 경로)
 - `request.override(system_prompt=base + memory_text)`로 base 보존하는 이유 이해
-- `is_blocked_input` 단락 패턴의 필요성 이해
+- `block_inappropriate_input` (@before_agent) 단락 패턴과 `is_blocked_input` 분리의 필요성 이해
 - `check_hallucination`이 search_contexts 있을 때만 호출되는 이유 이해
 
 ### agent/agent.py

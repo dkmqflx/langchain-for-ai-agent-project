@@ -306,7 +306,7 @@ store = InMemoryStore()           # user_id 기반 장기 기억
 | 파일 | 변경 |
 |------|------|
 | `backend/agent/agent.py` | **수정** - `PIIMiddleware` + `inject_memory` 추가 |
-| `backend/agent/middleware.py` | **수정** - `inject_memory` 함수 추가 (@wrap_model_call 데코레이터), `is_blocked_input`, `check_hallucination` 추가 |
+| `backend/agent/middleware.py` | **수정** - `inject_memory` 함수 추가 (@wrap_model_call 데코레이터), `block_inappropriate_input` (@before_agent 가드레일, 순수 스캔 함수 `is_blocked_input` 호출), `check_hallucination` 추가 |
 | `backend/agent/tools.py` | **수정** - `InjectedStore+RunnableConfig` → `ToolRuntime[AgentContext]` |
 | `backend/routers/chat.py` | **수정** - Before/After Guardrail 통합, `context=AgentContext(...)` 방식으로 변경 |
 
@@ -322,14 +322,14 @@ store = InMemoryStore()           # user_id 기반 장기 기억
 - 카드번호: 커스텀 regex detector → `****-****-****-1234`
 - `apply_to_input=True, apply_to_output=True`로 에이전트 내부에서 입출력 모두 처리
 
-**Before Agent Guardrail**: `is_blocked_input()` — 키워드 기반 욕설 차단. 탐지 시 `agent.invoke()` 호출 없이 즉시 거절 반환.
+**Before Agent Guardrail**: `block_inappropriate_input` — `@before_agent` 미들웨어로 키워드 기반 욕설 차단(공식 권장 방식). 탐지 시 `jump_to="end"`로 모델 호출 없이 단락하고 `state["blocked"]`/`block_reason`을 설정 → 라우터가 `status="blocked"`로 변환. 순수 스캔 로직은 테스트 용이하게 `is_blocked_input()` 함수로 분리해 미들웨어가 호출한다. (모든 진입점 `/chat`·`/chat/stream`에 자동 적용 — 라우터 중복 제거)
 
 **After Agent Guardrail**: `check_hallucination()` — GPT-4o-mini 감시자 모델로 할루시네이션 검증.
 - `result["messages"]`에서 `ToolMessage(name="search_documents")` 수집
 - 검색 컨텍스트 있을 때만 실행 (없으면 오탐 방지를 위해 생략)
 - `"HALLUCINATION"` 판정 시 교정 메시지로 대체
 
-**chat.py 파이프라인**: 욕설 체크 → 에이전트 실행(내부 PIIMiddleware 자동 실행) → 검색 컨텍스트 추출 → 할루시네이션 검증
+**chat.py 파이프라인**: 에이전트 실행(내부에서 Before Guardrail·PIIMiddleware 자동 실행) → `result["blocked"]` 차단 분기 → 검색 컨텍스트 추출 → 할루시네이션 검증
 
 ### 검증
 - 이메일/카드번호 포함 메시지 → 마스킹 확인
