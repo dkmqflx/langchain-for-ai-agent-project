@@ -1,410 +1,484 @@
-# Phase 1 학습 가이드 — Google OAuth2 인증
+# Phase 1 학습 가이드 — NextAuth 구글 로그인 + 공유 토큰 DB + 백엔드 JWT 검증
 
-이 가이드는 Phase 1에서 만든 파일들을 **의존성 순서대로** 읽으며, "우리 앱이 사용자 대신 Gmail/캘린더에 접근할 토큰을 받아 안전하게 보관하는 과정"을 이해하도록 구성했습니다.
+이 가이드는 Phase 1에서 만든 파일들을 **역할 순서대로** 읽으며, "프론트(NextAuth)가 구글 로그인을 처리하고 → 구글 토큰을 공유 DB에 저장하고 → 백엔드가 그 토큰을 빌려 실제 Gmail을 호출하는" 전체 흐름을 이해하도록 구성했습니다.
 
-> **Phase 1의 목표 한 줄**: 사용자의 비밀번호 없이, **제한된 권한의 토큰**을 받아 → **암호화해 DB에 저장** → **만료되면 자동 갱신**까지. (AI 기능은 Phase 2부터)
+> **Phase 1의 목표 한 줄**: NextAuth로 **구글 로그인 + Gmail/캘린더 권한 위임** → 구글 토큰을 **공유 Postgres에 저장** → 백엔드는 **앱 JWT로 사용자를 식별**하고 그 토큰으로 **실제 Gmail 호출**까지. (AI 기능은 Phase 2부터)
 
 ---
 
-## 0. 먼저: OAuth2가 왜 필요한가 (호텔 카드키 비유)
+## 0. 먼저: 누가 무엇을 하나 (역할 분담)
 
-사용자의 구글 비밀번호를 우리가 직접 받는 건 위험하고, 구글이 막아둡니다. 대신 표준 방식인 **OAuth2**를 씁니다.
+이 프로젝트는 **프론트(Next.js)** 와 **백엔드(FastAPI)** 가 따로 있습니다. Phase 1에서 가장 먼저 이해할 것은 "**인증을 누가 처리하는가**"입니다.
+
+```
+프론트(NextAuth)  →  구글 OAuth2 전담 (로그인/동의/콜백/토큰 교환)
+                    + 구글 토큰을 공유 Postgres에 저장
+                    + 백엔드용 "앱 JWT" 발급
+
+백엔드(FastAPI)   →  앱 JWT 검증으로 "누구인지" 확인
+                    + 공유 DB에서 그 사람의 구글 토큰을 읽어 Gmail 호출
+                    + 구글 access_token 갱신은 백엔드가 전담
+```
+
+### OAuth2가 왜 필요한가 (호텔 카드키 비유)
+
+사용자의 구글 비밀번호를 우리가 직접 받는 건 위험하고 구글이 막아둡니다. 대신 표준 방식 **OAuth2**를 씁니다.
 
 ```
 사용자  = 투숙객
 구글    = 호텔 프런트 (열쇠 발급처)
-우리 앱 = 벨보이
+NextAuth = 프런트와 협상하는 컨시어지   ← 이번 프로젝트에선 "프론트"가 이 역할
 ```
 
-- 투숙객(사용자)이 **프런트(구글)** 에 직접 가서 "이 벨보이가 내 방에 들어가도 됨"을 **동의**
-- 프런트는 벨보이에게 **마스터키가 아니라 제한된 카드키(토큰)** 를 발급
-- 벨보이(우리 앱)는 **비밀번호를 전혀 모름**. 카드키만 보유
+- 투숙객(사용자)이 **프런트(구글)** 에 직접 가서 "이 앱이 내 메일/일정에 접근해도 됨"을 **동의**
+- 프런트는 **마스터키가 아니라 제한된 카드키(토큰)** 를 발급
+- 우리 앱은 **비밀번호를 전혀 모름**. 토큰만 보유
 
-**토큰은 2종류** — 이게 OAuth에서 가장 헷갈리는 부분:
+### 이번 Phase의 "토큰"은 3종류 — 가장 헷갈리는 부분
 
-| 토큰 | 비유 | 수명 | 용도 |
-|------|------|------|------|
-| **access token** | 카드키 | 약 1시간 | 실제로 Gmail/캘린더를 열 때 사용 |
-| **refresh token** | 카드키 재발급 쿠폰 | 거의 영구 | access token이 만료되면 새로 발급 |
+| 토큰 | 누가 만드나 | 수명 | 용도 |
+|------|------------|------|------|
+| **구글 access token** | 구글 | 약 1시간 | 실제로 Gmail/캘린더를 열 때 |
+| **구글 refresh token** | 구글 | 거의 영구 | access token 만료 시 새로 발급 |
+| **앱 JWT** | NextAuth(우리) | 짧게(예: 분~시간) | **프론트→백엔드** 요청 시 "나 누구야"를 증명 |
 
-→ access token이 유출돼도 1시간 뒤 무효화되어 안전. refresh token은 절대 평문 저장 금지.
+핵심 구분:
+- **구글 토큰**은 "구글에게 무엇을 할 수 있는가"(Gmail 열기). 공유 DB `accounts`에 저장.
+- **앱 JWT**는 "백엔드에게 내가 누구인가"(`sub` = 우리 DB의 `users.id`). 프론트가 `Authorization: Bearer`로 전달.
+
+> ⚠️ **왜 앱 JWT를 따로 만드나? (이번 설계의 핵심)**
+> NextAuth의 기본 세션 토큰은 그냥 서명된 JWT가 아니라 **암호화된 JWE**입니다. 그래서 파이썬 백엔드에서 `pyjwt`로 바로 검증할 수 없습니다. 그래서 NextAuth가 **별도의 서명(HS256) JWT**를 `APP_JWT_SECRET`로 만들어주고, 백엔드는 같은 시크릿으로 그것만 검증합니다. (NextAuth 버전이 올라가도 안 깨지는 표준 방식)
 
 ---
 
 ## 학습 흐름도
 
 ```
-사용자가 "구글 로그인" 클릭
+[프론트] 사용자가 "구글 로그인" 클릭 → signIn("google")
         ↓
-[routers/auth.py]  GET /auth/login   → 구글 동의 화면으로 리다이렉트
-        ↓ (사용자가 동의)
-[routers/auth.py]  GET /auth/callback → 임시 code 수신
+[프론트/NextAuth]  구글 동의 화면 (scope: gmail.modify/send, calendar / access_type=offline)
+        ↓ (사용자 동의)
+[프론트/NextAuth]  /api/auth/callback/google → code→token 교환
         ↓
-[integrations/oauth.py]  code → access_token + refresh_token 교환
+[@auth/pg-adapter]  공유 Postgres에 저장
+        users(id, email)  /  accounts(refresh_token, access_token, providerAccountId=구글 sub)
         ↓
-[security.py]  refresh_token 암호화 (Fernet)
+[프론트/NextAuth]  session.strategy="jwt" → jwt/session 콜백에서 앱 JWT(sub=users.id) 발급
         ↓
-[db/models.py + session.py]  users 테이블에 저장
+[프론트 → 백엔드]  GET /auth/me   (헤더: Authorization: Bearer <앱 JWT>)
         ↓
-[routers/auth.py]  GET /auth/me → 저장된 토큰으로 실제 Gmail 호출 (검증)
+[백엔드/security.py]  앱 JWT 검증 → users.id 추출
+        ↓
+[백엔드/google_auth.py]  accounts에서 refresh_token 읽기 → access_token 갱신 → Gmail 호출 (검증)
 ```
 
-| 파일 | 한 줄 역할 |
-|------|-----------|
-| `config.py` | `.env`의 비밀값을 타입과 함께 한 곳에서 로딩 |
-| `security.py` | refresh_token 암호화/복호화 (Fernet) |
-| `db/session.py` | DB 연결 + 요청별 세션(`get_db`) |
-| `db/models.py` | `users` 테이블 설계도 |
-| `integrations/oauth.py` | 구글과 실제로 대화 (URL 생성/토큰 교환/갱신) |
-| `routers/auth.py` | 사용자가 드나드는 문 (`/login`, `/callback`, `/me`) |
-| `main.py` | 위 조각들을 조립해 서버로 기동 |
+| 파일 | 위치 | 한 줄 역할 |
+|------|------|-----------|
+| `auth.ts` | 프론트 | NextAuth 설정: Google Provider + pg-adapter + 앱 JWT 발급 |
+| `app/api/auth/[...nextauth]/route.ts` | 프론트 | NextAuth HTTP 핸들러 (로그인/콜백/세션) |
+| `login/page.tsx` | 프론트 | `signIn("google")` 버튼 |
+| `lib/api.ts` | 프론트 | 백엔드 호출 시 `Bearer <앱 JWT>` 자동 첨부 |
+| `config.py` | 백엔드 | `.env`의 비밀값을 타입과 함께 로딩 |
+| `db/session.py` | 백엔드 | DB 연결 + 요청별 세션(`get_db`) |
+| `db/models.py` | 백엔드 | NextAuth가 만든 `users`/`accounts` **읽기 매핑** |
+| `security.py` | 백엔드 | 앱 JWT 검증 + `get_current_user` 의존성 |
+| `integrations/google_auth.py` | 백엔드 | 저장된 토큰 복원 + access_token 갱신 + Gmail 호출 |
+| `routers/auth.py` | 백엔드 | `GET /auth/me` (검증용 엔드포인트) |
+| `main.py` | 백엔드 | 조각 조립 + 서버 기동 |
 
 ---
 
-## Step 1: `config.py` 읽기 (5분)
+## Part A — 프론트 (NextAuth)
 
-### 목표
-환경변수(비밀값)를 안전하고 타입 있게 관리하는 방식 이해
+### Step 1: `auth.ts` 읽기 (20분, 가장 중요)
 
-### 핵심 개념
+#### 목표
+NextAuth가 구글 OAuth를 전담하고, 구글 토큰을 공유 DB에 저장하고, 앱 JWT를 발급하는 설정을 이해
 
-**pydantic-settings** — `os.getenv()`를 코드 곳곳에 뿌리는 대신, 한 클래스에 모읍니다.
+#### 핵심 개념
+
+```ts
+import NextAuth from "next-auth"
+import Google from "next-auth/providers/google"
+import PostgresAdapter from "@auth/pg-adapter"
+import { Pool } from "pg"
+import { SignJWT } from "jose"
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL })
+
+export const { handlers, auth, signIn, signOut } = NextAuth({
+  adapter: PostgresAdapter(pool),       // ① 구글 토큰을 공유 Postgres에 저장
+  session: { strategy: "jwt" },         // ② adapter 쓸 때 반드시 명시!
+  providers: [
+    Google({
+      authorization: {
+        params: {
+          access_type: "offline",       // ③ refresh_token 받기 필수
+          prompt: "consent",
+          scope: "openid email profile " +
+            "https://www.googleapis.com/auth/gmail.modify " +
+            "https://www.googleapis.com/auth/gmail.send " +
+            "https://www.googleapis.com/auth/calendar",
+        },
+      },
+    }),
+  ],
+  callbacks: {
+    async jwt({ token, user }) {
+      if (user) token.uid = user.id     // ④ 최초 로그인 때 users.id 보관
+      return token
+    },
+    async session({ session, token }) {
+      // ⑤ 백엔드에 보낼 "앱 JWT"를 HS256으로 서명해 세션에 노출
+      const secret = new TextEncoder().encode(process.env.APP_JWT_SECRET)
+      session.appToken = await new SignJWT({ sub: token.uid as string })
+        .setProtectedHeader({ alg: "HS256" })
+        .setExpirationTime("1h")
+        .sign(secret)
+      return session
+    },
+  },
+})
+```
+
+**왜 이렇게 하나 — 네 가지 못 박기**
+
+- **① adapter**: `@auth/pg-adapter`가 로그인 시 `users`/`accounts`/`sessions` 테이블에 자동 저장. 구글 `refresh_token`은 `accounts.refresh_token`에 들어갑니다.
+- **② `session.strategy: "jwt"` 필수**: adapter를 붙이면 기본값이 `"database"`가 되는데, 그러면 **`jwt` 콜백이 실행되지 않아** 앱 JWT를 만들 수 없습니다. `jwt` 전략 + adapter 조합이면 → `jwt` 콜백도 돌고(앱 JWT 발급 가능), `linkAccount`로 구글 토큰도 `accounts`에 저장됩니다. **양쪽을 모두 얻는 유일한 조합**입니다.
+- **③ `access_type="offline"`**: 없으면 access_token만 받고 **refresh_token을 못 받습니다**(자동 갱신 불가). 초보자가 가장 많이 하는 실수.
+- **⑤ 앱 JWT는 서명 토큰**: NextAuth 기본 세션은 JWE(암호화)라 백엔드가 못 읽으므로, 검증 가능한 별도 HS256 JWT를 만들어 `session.appToken`으로 노출합니다.
+
+> 🔐 **보안 메모(학습 단계 단순화)**: `@auth/pg-adapter`는 `accounts.refresh_token`을 **평문**으로 저장합니다. 학습 단계라 그대로 둡니다. 실서비스에서는 컬럼 암호화(pgcrypto) 또는 암호화 커스텀 adapter를 적용하세요.
+
+#### 학습 질문
+- [ ] adapter를 붙였는데 `session.strategy`를 안 바꾸면 `jwt` 콜백이 왜 안 도나?
+- [ ] `access_type="offline"`을 빼면 백엔드 `/auth/me`에서 무슨 일이 생길까?
+- [ ] 왜 NextAuth 기본 세션 토큰을 그대로 백엔드에 보내면 안 될까? (힌트: JWE)
+
+---
+
+### Step 2: `route.ts` + `login/page.tsx` + `lib/api.ts` (10분)
+
+#### 핵심 개념
+
+**`app/api/auth/[...nextauth]/route.ts`** — NextAuth를 HTTP로 노출
+```ts
+import { handlers } from "@/auth"
+export const { GET, POST } = handlers
+```
+
+**`login/page.tsx`** — 로그인 버튼
+```tsx
+import { signIn } from "@/auth"
+export default function Login() {
+  return <form action={async () => { "use server"; await signIn("google") }}>
+    <button>구글로 로그인</button>
+  </form>
+}
+```
+
+**`lib/api.ts`** — 백엔드 호출 시 앱 JWT 첨부
+```ts
+import { auth } from "@/auth"
+export async function apiFetch(path: string, init: RequestInit = {}) {
+  const session = await auth()
+  return fetch(`${process.env.NEXT_PUBLIC_API_URL}${path}`, {
+    ...init,
+    headers: { ...init.headers, Authorization: `Bearer ${session?.appToken}` },
+  })
+}
+```
+
+#### 학습 질문
+- [ ] 백엔드는 어떻게 "이 요청이 누구 것"인지 알까? (힌트: Bearer)
+- [ ] `appToken`이 만료되면 어떻게 새로 받을까? (힌트: session 콜백이 매번 재서명)
+
+---
+
+## Part B — 백엔드 (FastAPI)
+
+### Step 3: `config.py` 읽기 (5분)
+
+#### 목표
+환경변수(비밀값)를 타입 있게 한 곳에서 관리
+
 ```python
 class Settings(BaseSettings):
-    database_url: str          # 필수 (없으면 시작 시 에러)
-    google_client_id: str
-    token_encryption_key: str
-    oauth_redirect_uri: str = "http://localhost:8000/auth/callback"  # 기본값
+    database_url: str                 # 공유 Postgres (NextAuth와 동일 DB)
+    app_jwt_secret: str               # NextAuth와 공유 (앱 JWT 검증)
+    google_client_id: str             # access_token 갱신에 필요
+    google_client_secret: str         # access_token 갱신에 필요
 ```
 
-**왜 좋은가**
-- 필수 값이 빠지면 **런타임이 아니라 서버 시작 시 즉시** 에러 → 빨리 발견
-- `@lru_cache`로 `.env`를 한 번만 읽어 재사용 (FastAPI 공식 권장 패턴)
+> **왜 백엔드도 구글 client_id/secret가 필요한가**: 구글 access_token을 refresh_token으로 갱신하려면, 갱신 요청에 **클라이언트 자격증명(client_id + client_secret)** 이 함께 들어가야 합니다(웹 클라이언트). 그래서 프론트(NextAuth)와 백엔드가 같은 구글 자격증명을 공유합니다.
 
-**`.env` 위치**: `backend/`의 **상위 폴더**(`02.personal-assitant-agent/.env`)에서 읽습니다. (코드와 비밀값 분리)
+- `@lru_cache`로 `.env`를 한 번만 읽어 재사용(FastAPI 공식 권장).
+- `.env` 위치: `backend/`의 상위(`02.personal-assitant-agent/.env`).
 
-### 학습 질문
-- [ ] 필수 값(타입만 선언)과 선택 값(기본값 있음)의 차이는?
-- [ ] `@lru_cache`가 없으면 매 요청마다 무슨 일이 생길까?
-- [ ] `extra="ignore"`는 왜 넣었을까? (힌트: 미래 Phase에서 쓸 키)
+#### 학습 질문
+- [ ] `app_jwt_secret`이 프론트와 다르면 무슨 일이 생길까?
+- [ ] 백엔드가 구글 토큰을 "갱신"하려면 왜 client_secret이 필요할까?
 
 ---
 
-## Step 2: `security.py` 읽기 (5분)
+### Step 4: `db/session.py` + `db/models.py` 읽기 (15분)
 
-### 목표
-refresh_token을 왜, 어떻게 암호화하는지 이해
+#### 목표
+공유 DB에 연결하고, **NextAuth가 만든 테이블을 읽는** 매핑을 이해
 
-### 핵심 개념
-
-**Fernet** = 대칭키 암호화. 같은 키로 잠그고(encrypt) 연다(decrypt).
+#### `db/session.py` — 연결 3대 구성요소
 ```python
-enc = security.encrypt("1//0g...refresh...")  # DB 저장 직전
-dec = security.decrypt(enc)                     # API 호출 직전
+engine = create_engine(DATABASE_URL)        # 커넥션 풀 (앱당 1개)
+SessionLocal = sessionmaker(bind=engine)    # 요청마다 세션 팩토리
+class Base(DeclarativeBase): ...
 ```
+`get_db()`는 `yield` 의존성으로 요청마다 열고 `finally`에서 닫습니다(누수 방지).
 
-**왜 암호화하나**: refresh_token은 사실상 "영구 출입증". DB가 유출돼도 평문이면 공격자가 사용자의 Gmail에 **무기한** 접근. 암호화하면 키(`TOKEN_ENCRYPTION_KEY`) 없이는 무용지물.
+**커넥션 문자열**: `postgresql+psycopg://...` ✅ (psycopg3 명시) / `postgresql://...` 🔴
 
-**키 생성**:
-```bash
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-```
+#### `db/models.py` — **읽기 매핑** (가장 중요한 차이점)
 
-### 학습 질문
-- [ ] access_token은 왜 굳이 암호화하지 않아도 상대적으로 덜 위험할까? (힌트: 수명)
-- [ ] `TOKEN_ENCRYPTION_KEY`를 잃어버리면 저장된 토큰은 어떻게 될까?
-
----
-
-## Step 3: `db/session.py` 읽기 (10분)
-
-### 목표
-SQLAlchemy로 DB에 연결하고, 요청마다 안전하게 세션을 열고 닫는 패턴 이해
-
-### 핵심 개념
-
-**3대 구성요소**
-```python
-engine = create_engine(DATABASE_URL)   # DB로 가는 커넥션 풀 (앱당 1개)
-SessionLocal = sessionmaker(bind=engine)  # 요청마다 만들 세션 팩토리
-class Base(DeclarativeBase): ...         # 모든 테이블 모델의 부모
-```
-
-**`get_db()` — yield 의존성** (FastAPI 공식: di-yield-cleanup)
-```python
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db        # ← 여기가 엔드포인트로 주입됨
-    finally:
-        db.close()      # ← 요청이 끝나면(에러가 나도) 반드시 닫힘
-```
-요청 처리 중 예외가 터져도 `finally`에서 커넥션을 반납 → **누수 방지**.
-
-**커넥션 문자열 주의** (프로젝트 1과 동일):
-```
-postgresql+psycopg://...   ✅ (psycopg3 드라이버 명시)
-postgresql://...           🔴 (psycopg2로 오해 → 오류 가능)
-```
-
-**동기(sync)로 쓰는 이유**: psycopg/SQLAlchemy 호출은 블로킹 I/O. 그래서 이걸 쓰는 엔드포인트는 `async def`가 아니라 `def`로 선언해 FastAPI가 threadpool에서 돌립니다 (다음 Step에서 다시 등장).
-
-### 학습 질문
-- [ ] engine은 앱당 1개인데 session은 왜 요청마다 새로 만들까?
-- [ ] `yield` 대신 `return db`를 쓰면 무엇이 문제일까?
-- [ ] `pool_pre_ping=True`는 무엇을 막아줄까? (힌트: 끊긴 커넥션)
-
----
-
-## Step 4: `db/models.py` 읽기 (5분)
-
-### 목표
-토큰을 어떤 표(테이블)에 저장할지 — `users` 단일 테이블 설계 이해
-
-### 핵심 개념
-
-**"표 1개" 설계** (한 사용자 = 한 구글 계정 = 한 토큰셋, 1:1)
 ```python
 class User(Base):
-    __tablename__ = "users"
-    id: Mapped[int]               # PK
-    google_sub: Mapped[str]       # 구글의 변하지 않는 고유 ID (진짜 식별자)
-    email: Mapped[str]            # 표시/조회용 (바뀔 수 있음)
-    refresh_token_enc: Mapped[str]      # 암호화된 refresh token
-    access_token: Mapped[str | None]    # 1시간짜리, 갱신 시 덮어씀
-    token_expiry: Mapped[datetime | None]
-    created_at / updated_at
+    __tablename__ = "users"           # NextAuth가 만든 테이블
+    id: Mapped[str]                   # PK (cuid/uuid) — 앱 JWT의 sub가 이 값
+    email: Mapped[str]
+
+class Account(Base):
+    __tablename__ = "accounts"
+    userId: Mapped[str]               # users.id 참조
+    provider: Mapped[str]             # "google"
+    providerAccountId: Mapped[str]    # ← 구글의 sub (불변 ID)
+    refresh_token: Mapped[str | None]
+    access_token: Mapped[str | None]
+    expires_at: Mapped[int | None]    # epoch seconds
 ```
 
-**왜 email이 아니라 `google_sub`로 사용자를 식별하나**: 이메일은 변경될 수 있지만 `sub`(구글 고유 ID)는 불변. 그래서 upsert 기준은 `google_sub`.
+> ⚠️ **`create_all` 금지**: 이 `users`/`accounts` 테이블은 **NextAuth(adapter)가 소유·생성**합니다. 백엔드가 `Base.metadata.create_all`로 또 만들면 두 쪽이 스키마를 두고 충돌합니다. 백엔드는 **읽기만** 합니다. (백엔드 고유 테이블인 선호도 테이블만 백엔드가 생성)
 
-**SQLAlchemy 2.0 스타일**: `Mapped[...]` + `mapped_column(...)`은 최신 공식 표기(타입 힌트 친화적). 구식 `Column(...)` 아님.
+> **식별자 정리**: 앱 JWT의 `sub` = `users.id`(우리 DB). 구글의 sub = `accounts.providerAccountId`. 백엔드는 `users.id`로 `accounts` 행을 찾아 구글 토큰을 얻습니다.
 
-**트레이드오프**: 실서비스에서 토큰 이력/다중 제공자(구글+다른 서비스)가 필요하면 `oauth_tokens` 테이블로 분리. Phase 1은 학습용이라 1개로 단순화.
-
-### 학습 질문
-- [ ] 왜 `token_expiry`는 timezone 없는 DateTime일까? (힌트: 구글 라이브러리 포맷)
-- [ ] `unique=True, index=True`를 email/google_sub에 둔 이유는?
+#### 학습 질문
+- [ ] 왜 백엔드는 `users`/`accounts`를 `create_all` 하면 안 될까?
+- [ ] 앱 JWT의 `sub`는 구글 sub일까, 우리 DB의 `users.id`일까?
 
 ---
 
-## Step 5: `integrations/oauth.py` 읽기 (15분, 가장 중요)
+### Step 5: `security.py` 읽기 (10분)
 
-### 목표
-구글과의 OAuth2 4단계 대화를 코드로 이해
+#### 목표
+프론트가 보낸 앱 JWT를 검증해 "현재 사용자"를 도출하는 의존성 이해
 
-### 핵심 개념 — 4개의 함수
-
-**① `authorization_url()` — 동의 화면 URL 만들기**
 ```python
-url, state = flow.authorization_url(
-    access_type="offline",   # ← refresh_token을 받기 위해 필수!
-    prompt="consent",        # ← 매번 동의 → refresh_token 확실히 수령
-)
+import jwt                                     # pyjwt
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from config import get_settings
+
+bearer = HTTPBearer()
+
+def get_current_user_id(
+    cred: HTTPAuthorizationCredentials = Depends(bearer),
+) -> str:
+    try:
+        payload = jwt.decode(
+            cred.credentials,
+            get_settings().app_jwt_secret,
+            algorithms=["HS256"],              # 프론트와 동일 알고리즘/시크릿
+        )
+    except jwt.PyJWTError:
+        raise HTTPException(401, "유효하지 않은 토큰")
+    return payload["sub"]                       # = users.id
 ```
-`access_type="offline"`가 없으면 access_token만 받고 **refresh_token을 못 받습니다** (자동 갱신 불가). 이게 초보자가 가장 많이 하는 실수.
 
-**② `exchange_code(code, state)` — 임시 코드 → 진짜 토큰**
-```python
-flow.fetch_token(code=code)
-return flow.credentials   # access_token + refresh_token + id_token + expiry
-```
+- `HTTPBearer`로 `Authorization: Bearer <앱 JWT>` 헤더를 꺼냅니다(FastAPI 공식 보안 유틸).
+- 검증 성공 → `sub`(=`users.id`) 반환. 엔드포인트는 `Depends(get_current_user_id)`로 주입받습니다.
+- **NextAuth 기본 JWE를 검증하는 게 아니라**, 우리가 서명한 HS256 JWT만 검증합니다.
 
-**③ `user_info_from_credentials(creds)` — 누구인지 알아내기**
-```python
-info = id_token.verify_oauth2_token(creds.id_token, request, CLIENT_ID)
-return {"sub": info["sub"], "email": info["email"]}
-```
-`id_token`은 사용자 정보가 담긴 서명된 JWT. 검증하면 별도 API 호출 없이 email/sub를 얻습니다.
-
-**④ `build_user_credentials()` + `ensure_fresh()` — 저장된 토큰 복원 & 자동 갱신**
-```python
-creds = build_user_credentials(access_token, refresh_token, expiry)
-if not creds.valid:            # 만료됐거나 access_token이 없으면
-    creds.refresh(Request())   # refresh_token으로 새 access_token 발급
-```
-**Phase 1 검증의 핵심**: `expiry`를 넣어줘야 `creds.valid`가 실제 만료 여부를 정확히 판단합니다.
-
-**알아두면 좋은 함정** — `OAUTHLIB_RELAX_TOKEN_SCOPE=1`:
-구글이 돌려주는 scope 순서가 요청과 달라 `"Scope has changed"` 오류가 날 수 있어, 파일 상단에서 이 환경변수를 미리 설정해 막았습니다.
-
-### 학습 질문
-- [ ] `access_type="offline"`을 빼면 `/auth/me`에서 무슨 일이 생길까?
-- [ ] `id_token`(누구인지)과 `access_token`(무엇을 할 수 있는지)의 차이는?
-- [ ] 이 파일은 왜 DB를 import하지 않을까? (힌트: 책임 분리)
+#### 학습 질문
+- [ ] 프론트가 NextAuth 기본 세션 토큰을 그대로 보냈다면 이 코드는 왜 실패할까?
+- [ ] `algorithms=["HS256"]`을 빼거나 시크릿이 다르면?
 
 ---
 
-## Step 6: `routers/auth.py` 읽기 (15분)
+### Step 6: `integrations/google_auth.py` 읽기 (15분)
 
-### 목표
-3개 엔드포인트로 OAuth 흐름을 사용자에게 노출하는 방식 이해
+#### 목표
+저장된 구글 토큰을 복원하고, 만료 시 **백엔드가 직접 갱신**해 Gmail을 호출하는 흐름 이해
 
-### 핵심 개념
-
-**`GET /auth/login`** — 시작
 ```python
-url, state = oauth.authorization_url()
-request.session["oauth_state"] = state   # CSRF 방어용으로 세션에 보관
-return RedirectResponse(url)
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from config import get_settings
+
+SCOPES = ["https://www.googleapis.com/auth/gmail.modify", ...]
+
+def build_credentials(account) -> Credentials:
+    s = get_settings()
+    return Credentials(
+        token=account.access_token,
+        refresh_token=account.refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=s.google_client_id,          # ← 갱신에 필요
+        client_secret=s.google_client_secret,  # ← 갱신에 필요
+        scopes=SCOPES,
+    )
+
+def ensure_fresh(creds: Credentials) -> Credentials:
+    if not creds.valid:                         # 만료/없음
+        creds.refresh(Request())                # refresh_token으로 새 access_token
+    return creds
 ```
 
-**`GET /auth/callback`** — 돌아옴 + 저장
-```python
-if request.session.get("oauth_state") != state:   # CSRF 검증
-    raise HTTPException(400, "유효하지 않은 state")
-creds = oauth.exchange_code(code, state)
-if not creds.refresh_token:                         # 안전장치
-    raise HTTPException(400, "권한 해제 후 재로그인 안내")
-info = oauth.user_info_from_credentials(creds)
-# google_sub 기준 upsert → refresh_token 암호화 저장
-```
+**왜 백엔드가 갱신을 전담하나 (이중 갱신 레이스 방지)**: NextAuth와 백엔드가 둘 다 갱신하면 토큰 회전(rotation) 경쟁이 생깁니다. 그래서 **NextAuth는 최초 1회 캡처만, 이후 갱신은 백엔드만** 합니다. 갱신 후 새 `access_token`/`expires_at`을 DB `accounts`에 다시 저장하면 다음 호출이 빨라집니다.
 
-**`GET /auth/me`** — 검증 (E2E)
 ```python
-creds = oauth.build_user_credentials(access_token, decrypt(refresh_token_enc), expiry)
-creds = oauth.ensure_fresh(creds)   # 만료 시 자동 갱신
-# 갱신된 토큰 다시 저장
 service = build("gmail", "v1", credentials=creds)
 profile = service.users().getProfile(userId="me").execute()
 ```
-이 호출이 성공하면 **로그인 → 저장 → 갱신 → 실제 사용** 전 과정이 동작한다는 증거.
 
-**엔드포인트가 `def`인 이유** (FastAPI 공식: async-def-vs-def):
-google-api-python-client와 SQLAlchemy(sync)는 블로킹. `def`로 선언하면 FastAPI가 threadpool에서 실행해 이벤트 루프를 막지 않습니다.
-
-> ⚠️ **`/auth/me`의 보안 한계 (학습용)**: 사용자를 `email` 쿼리 파라미터로 식별하므로,
-> 이 주소를 아는 사람은 누구나 그 사람의 Gmail 프로필을 조회할 수 있습니다. Phase 1은
-> **로컬 단일 사용자 검증용**이라 의도적으로 단순화한 것입니다. 실서비스에서는 앱 자체의
-> 로그인 세션/인증 토큰에서 "현재 사용자"를 도출해야 하며, 이메일을 클라이언트가 직접
-> 보내게 하면 안 됩니다.
-
-### 학습 질문
-- [ ] `state`를 세션에 저장했다가 콜백에서 비교하는 이유(CSRF)는?
-- [ ] callback에서 refresh_token이 없을 때 굳이 막는 이유는?
-- [ ] upsert 기준이 email이 아니라 google_sub인 이유는? (Step 4 복습)
+#### 학습 질문
+- [ ] 백엔드가 `client_secret` 없이 `creds.refresh()`를 부르면 어떻게 될까?
+- [ ] 왜 NextAuth와 백엔드가 동시에 갱신하면 안 될까?
 
 ---
 
-## Step 7: `main.py` 읽기 (5분)
+### Step 7: `routers/auth.py` + `main.py` 읽기 (10분)
 
-### 목표
-조각들을 조립해 서버로 기동하는 방식 이해
-
-### 핵심 개념
-
+#### `GET /auth/me` — E2E 검증 엔드포인트
 ```python
-@asynccontextmanager
-async def lifespan(app):
-    Base.metadata.create_all(bind=engine)   # 시작 시 테이블 생성
-    yield
+@router.get("/auth/me")
+def me(user_id: str = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    account = db.query(Account).filter_by(userId=user_id, provider="google").one()
+    creds = ensure_fresh(build_credentials(account))
+    # 갱신됐으면 account.access_token/expires_at 다시 저장
+    service = build("gmail", "v1", credentials=creds)
+    profile = service.users().getProfile(userId="me").execute()
+    return {"user_id": user_id, "email": profile["emailAddress"],
+            "messages_total": profile["messagesTotal"]}
+```
+이 호출이 성공하면 **로그인(NextAuth) → 토큰 저장(DB) → JWT 검증(백엔드) → 갱신 → 실제 Gmail 사용** 전 과정이 동작한다는 증거입니다.
 
-app.add_middleware(SessionMiddleware, secret_key=...)   # OAuth state 보관
+#### `main.py`
+```python
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000"])
 app.include_router(auth.router)
 ```
+- **SessionMiddleware 불필요**: OAuth state는 프론트 NextAuth가 관리합니다(백엔드는 쿠키 세션을 쓰지 않음).
+- **인증 테이블 `create_all` 안 함**: NextAuth가 소유. lifespan에서는 백엔드 고유 테이블(선호도 등)만 생성.
 
-- **lifespan**: 시작/종료 훅 (FastAPI 공식, 구식 `@app.on_event` 아님). 여기선 테이블 생성.
-  - ⚠️ 학습용 간이 방식. 실서비스는 **Alembic 마이그레이션** 사용.
-- **SessionMiddleware**: `request.session`을 쓰려면 필수. `itsdangerous`로 서명된 쿠키.
-- **`from db import models`**: `create_all` 전에 User 모델을 Base에 등록하기 위한 import.
+> 엔드포인트가 `def`(동기)인 이유: google-api-python-client·SQLAlchemy는 블로킹 I/O. `def`로 선언하면 FastAPI가 threadpool에서 실행해 이벤트 루프를 막지 않습니다(FastAPI 공식: async-def-vs-def).
 
-### 학습 질문
-- [ ] `from db import models`를 빼면 테이블이 안 생기는 이유는?
-- [ ] SessionMiddleware를 빼면 `/auth/login`에서 무슨 에러가 날까?
+#### 학습 질문
+- [ ] 백엔드에서 SessionMiddleware가 더 이상 필요 없는 이유는?
+- [ ] lifespan에서 `users`/`accounts`를 만들면 안 되는 이유는?
 
 ---
 
-## 실습: 처음부터 끝까지 동작시키기 (20분)
+## 실습: 처음부터 끝까지 동작시키기 (30분)
 
 ### A. Google Cloud Console 설정 (최초 1회)
 
-1. https://console.cloud.google.com → 프로젝트 생성(또는 선택)
-2. **API 및 서비스 → 라이브러리** 에서 **Gmail API**, **Google Calendar API** 사용 설정
-3. **OAuth 동의 화면** 구성
-   - User Type: **외부(External)**
-   - 앱 이름/이메일 입력
-   - **테스트 사용자(Test users)** 에 본인 구글 계정 추가 (게시 전엔 테스트 사용자만 로그인 가능)
-   - 범위(scope)는 코드가 요청하므로 여기선 추가 안 해도 됨
-4. **사용자 인증 정보 → 사용자 인증 정보 만들기 → OAuth 클라이언트 ID**
+1. https://console.cloud.google.com → 프로젝트 생성/선택
+2. **API 및 서비스 → 라이브러리**: **Gmail API**, **Google Calendar API** 사용 설정
+3. **OAuth 동의 화면**: User Type **외부(External)**, 앱 이름/이메일 입력, **테스트 사용자**에 본인 계정 추가
+4. **사용자 인증 정보 → OAuth 클라이언트 ID**
    - 유형: **웹 애플리케이션**
-   - **승인된 리디렉션 URI**: `http://localhost:8000/auth/callback` (코드의 `OAUTH_REDIRECT_URI`와 정확히 일치!)
-   - 생성 후 **클라이언트 ID / 클라이언트 보안 비밀** 복사
+   - **승인된 리디렉션 URI**: `http://localhost:3000/api/auth/callback/google` ← **NextAuth(프론트) 콜백**
+   - 클라이언트 ID / 보안 비밀 복사
 
-> 로컬은 `http://localhost` 리다이렉트가 허용되어 HTTPS 없이 테스트 가능합니다. (HTTPS는 Phase 8 배포에서.)
+> 로컬은 `http://localhost` 리다이렉트가 허용됩니다. (HTTPS는 Phase 8 배포에서.)
 
-### B. DB 준비
+### B. DB 준비 (프론트·백엔드 공유)
 
 ```bash
-# 프로젝트 1과 동일 PostgreSQL(localhost:5433)에 DB만 새로 생성
 psql -h localhost -p 5433 -U postgres -c "CREATE DATABASE assistant_db;"
 ```
+> `users`/`accounts`/`sessions` 테이블은 **NextAuth(adapter)가 처음 로그인 때 자동 생성**(또는 adapter 마이그레이션)합니다. 백엔드는 만들지 않습니다.
 
-### C. `.env` 작성
+### C. `.env` 작성 (공유 시크릿 주의)
 
+**프론트 `frontend/.env.local`**
 ```bash
-cd 02.personal-assitant-agent
-cp .env.example .env
+AUTH_SECRET=$(npx auth secret)        # NextAuth 세션 키
+AUTH_GOOGLE_ID=<클라이언트 ID>
+AUTH_GOOGLE_SECRET=<보안 비밀>
+DATABASE_URL=postgresql://postgres:postgres@localhost:5433/assistant_db
+APP_JWT_SECRET=<아래에서 생성>        # ★ 백엔드와 반드시 동일
+NEXT_PUBLIC_API_URL=http://localhost:8000
 ```
-`.env`를 열어 채웁니다:
+
+**백엔드 `02.personal-assitant-agent/.env`**
 ```bash
 DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5433/assistant_db
-GOOGLE_CLIENT_ID=<복사한 클라이언트 ID>
-GOOGLE_CLIENT_SECRET=<복사한 보안 비밀>
-OAUTH_REDIRECT_URI=http://localhost:8000/auth/callback
-
-# 아래 두 키 생성해서 붙여넣기
-TOKEN_ENCRYPTION_KEY=$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
-SESSION_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
+APP_JWT_SECRET=<위와 동일한 값>       # ★ 프론트와 동일해야 검증됨
+GOOGLE_CLIENT_ID=<클라이언트 ID>      # 토큰 갱신용
+GOOGLE_CLIENT_SECRET=<보안 비밀>
 ```
 
-### D. 서버 실행
+```bash
+# APP_JWT_SECRET 생성 (양쪽에 같은 값)
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+### D. 실행 (두 개 다 켜기)
 
 ```bash
+# 터미널 1 — 백엔드
 cd 02.personal-assitant-agent/backend
 uv run uvicorn main:app --reload --port 8000
+
+# 터미널 2 — 프론트
+cd 02.personal-assitant-agent/frontend
+npm install && npm run dev   # http://localhost:3000
 ```
 
 ### E. E2E 테스트 (브라우저)
 
 ```
-1. http://localhost:8000/auth/login  접속
-       → 구글 동의 화면 → [허용]
-2. 자동으로 /auth/callback 로 돌아오며 "로그인 성공 ✅" 표시
-3. 표시된 링크 /auth/me?email=<your@gmail.com> 클릭
-       → {"email": "...", "messages_total": 1234, ...} 가 보이면 성공!
+1. http://localhost:3000/login → "구글로 로그인" → 동의 [허용]
+2. 로그인 성공 후 DB 확인:
+     - users 에 행 1개
+     - accounts 에 refresh_token 저장됨
+3. 앱이 /auth/me 를 Bearer <앱 JWT>로 호출 → 실제 Gmail 프로필이 보이면 성공!
+```
+
+`/auth/me`를 직접 확인하려면, 로그인 후 세션의 `appToken`을 복사해:
+```bash
+curl http://localhost:8000/auth/me -H "Authorization: Bearer <appToken>"
+# → {"user_id":"...", "email":"...", "messages_total": 1234}
 ```
 
 ### F. 자동 갱신 확인 (선택)
 
 ```sql
--- DB에서 만료시각을 과거로 강제 → /auth/me 재호출 시 자동 갱신되는지 확인
-UPDATE users SET token_expiry = '2000-01-01 00:00:00';
+-- access_token 만료를 과거로 강제 → /auth/me 재호출 시 백엔드가 자동 갱신하는지 확인
+UPDATE accounts SET expires_at = 0 WHERE provider = 'google';
 ```
-이후 `/auth/me`를 다시 열면, 만료된 access_token이 refresh_token으로 **자동 갱신**되어 정상 응답해야 합니다. DB의 `access_token`/`token_expiry`가 갱신됐는지 확인하세요.
+이후 `/auth/me`가 정상 응답하고 `accounts.access_token`/`expires_at`이 갱신됐는지 확인하세요.
 
 ---
 
 ## 검증 체크리스트
 
 ### 개념
-- [ ] access token / refresh token의 차이와 수명을 설명할 수 있다
-- [ ] `access_type="offline"`이 refresh_token 수령에 왜 필수인지 안다
-- [ ] refresh_token을 암호화 저장하는 이유를 설명할 수 있다
+- [ ] OAuth를 **프론트(NextAuth)** 가 처리하고 **백엔드는 토큰을 소비**한다는 분담을 설명할 수 있다
+- [ ] 구글 토큰(access/refresh)과 앱 JWT의 차이·용도를 구분할 수 있다
+- [ ] NextAuth 기본 세션이 JWE라 백엔드가 못 읽고, 그래서 별도 서명 JWT를 쓰는 이유를 안다
+- [ ] adapter + `session.strategy="jwt"` 조합이 왜 필요한지 안다
 
 ### 코드
-- [ ] `config.py`: 필수/선택 설정 구분, `@lru_cache`의 역할
-- [ ] `security.py`: Fernet 암복호화 왕복
-- [ ] `db/session.py`: engine/session/Base 역할, `get_db` yield 패턴
-- [ ] `db/models.py`: google_sub로 식별하는 이유
-- [ ] `integrations/oauth.py`: 4개 함수의 흐름
-- [ ] `routers/auth.py`: login→callback→me 흐름, `def`인 이유
+- [ ] `auth.ts`: provider scope/offline, adapter, jwt 전략, 앱 JWT 발급
+- [ ] `config.py`: 공유 `APP_JWT_SECRET`, 갱신용 구글 client 자격증명
+- [ ] `db/models.py`: `users`/`accounts` 읽기 매핑, `create_all` 금지
+- [ ] `security.py`: `get_current_user_id`로 앱 JWT 검증
+- [ ] `google_auth.py`: 백엔드 전담 갱신 + Gmail 호출
 
 ### 동작
-- [ ] `/auth/login` → 구글 동의 → `/auth/callback` "로그인 성공"
-- [ ] DB `users` 테이블에 행이 생기고 `refresh_token_enc`가 **암호문**이다
-- [ ] `/auth/me` 가 실제 Gmail 프로필을 반환한다
-- [ ] 만료시각을 과거로 바꿔도 `/auth/me`가 자동 갱신 후 동작한다
+- [ ] NextAuth 구글 로그인 → `accounts`에 refresh_token 저장
+- [ ] 프론트가 `Bearer <앱 JWT>`로 `/auth/me` 호출 → 실제 Gmail 프로필 반환
+- [ ] `expires_at`을 과거로 바꿔도 백엔드가 자동 갱신 후 동작
 
 ---
 
@@ -412,19 +486,21 @@ UPDATE users SET token_expiry = '2000-01-01 00:00:00';
 
 | 증상 | 원인/해결 |
 |------|-----------|
-| `redirect_uri_mismatch` | 구글 콘솔의 리디렉션 URI와 `OAUTH_REDIRECT_URI`가 글자까지 일치해야 함 |
+| `redirect_uri_mismatch` | 구글 콘솔 URI와 NextAuth 콜백(`http://localhost:3000/api/auth/callback/google`)이 글자까지 일치해야 함 |
 | 로그인 화면에서 차단됨 | OAuth 동의 화면 "테스트 사용자"에 본인 계정 추가 안 함 |
-| `refresh_token`이 None | 이미 동의한 적 있어 미발급 → https://myaccount.google.com/permissions 에서 앱 제거 후 재로그인 |
-| `Scope has changed` | 코드가 `OAUTHLIB_RELAX_TOKEN_SCOPE=1`을 설정해 방지함 (재확인) |
-| `can't compare offset-naive and offset-aware datetimes` | `token_expiry` 컬럼을 naive DateTime으로 둔 이유(구글 expiry가 naive UTC). DB가 tz-aware로 돌려주도록 설정돼 있으면 발생 가능 → 컬럼/세션 tz 설정 확인 |
-| DB 연결 오류 | `assistant_db` 생성 여부, `postgresql+psycopg://` 형식 확인 |
+| `accounts.refresh_token`이 NULL | `access_type=offline`/`prompt=consent` 누락, 또는 이미 동의해 미발급 → https://myaccount.google.com/permissions 에서 앱 제거 후 재로그인 |
+| `jwt` 콜백이 안 불림 / `appToken` 없음 | adapter 사용 시 `session.strategy="jwt"` 누락 (기본 `database`라 jwt 콜백 미실행) |
+| 백엔드 401 (유효하지 않은 토큰) | 프론트/백엔드 `APP_JWT_SECRET` 불일치, 또는 NextAuth 기본 세션을 잘못 보냄 |
+| `creds.refresh()` 실패 | 백엔드에 `GOOGLE_CLIENT_ID`/`SECRET` 누락 (갱신엔 클라이언트 자격증명 필요) |
+| 백엔드가 `users`/`accounts`를 못 찾음 | NextAuth가 먼저 로그인하며 테이블을 생성해야 함 (백엔드는 읽기만) |
+| DB 연결 오류 | `assistant_db` 생성 여부, 백엔드는 `postgresql+psycopg://` 형식 확인 |
 
 ---
 
 ## 다음 단계
 
-Phase 1을 완료했으면 (토큰을 안전하게 확보):
-- **Phase 2**: Gmail / Calendar Tool 연결 — 저장한 토큰으로 에이전트가 실제 메일·일정 조회/조작
+Phase 1을 완료했으면 (토큰을 안전하게 확보 + 사용자 식별):
+- **Phase 2**: Gmail / Calendar Tool 연결 — 저장한 토큰으로 에이전트가 실제 메일·일정 조회/조작 (`ToolRuntime[AgentContext]`로 `user_id` 접근)
 - **Phase 3**: Structured Output (EmailAnalysis) — 메일을 의도·우선순위 스키마로 파싱
 
-Phase 1에서 "토큰을 어떻게 얻고 보관하는가"를 이해했으니, Phase 2는 그 토큰을 **도구(Tool)로 감싸 에이전트에 쥐여주는** 단계입니다.
+Phase 1에서 "누가 토큰을 얻고 누가 소비하는가"를 이해했으니, Phase 2는 그 토큰을 **도구(Tool)로 감싸 에이전트에 쥐여주는** 단계입니다.

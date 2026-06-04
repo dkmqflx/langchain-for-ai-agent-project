@@ -31,11 +31,13 @@
 | **LLM** | OpenAI GPT-4o (메인), GPT-4o-mini (분류·Guardrail 감시자) |
 | **Agent 프레임워크** | LangChain (`create_agent` + middleware) |
 | **외부 API** | Gmail API, Google Calendar API (google-api-python-client) |
-| **인증** | OAuth2 (google-auth-oauthlib), refresh token 서버 보관 |
+| **로그인 인증** | NextAuth(Auth.js v5) Google Provider — 프론트가 OAuth2 전담, 세션 전략 `jwt` |
+| **API 인증** | 앱 전용 서명 JWT(HS256, 공유 `APP_JWT_SECRET`) → FastAPI가 `pyjwt`로 검증 |
+| **구글 토큰 갱신** | NextAuth `@auth/pg-adapter`가 `accounts`에 저장 → FastAPI가 읽어 `google-auth`로 갱신·호출 |
 | **웹 검색** | Tavily Search API |
-| **데이터 저장소** | PostgreSQL (대화 맥락 + 선호도 + OAuth 토큰 통합) |
+| **데이터 저장소** | PostgreSQL (NextAuth 인증 테이블 `users`/`accounts`/`sessions` + 대화 맥락 + 선호도 통합) |
 | **백엔드** | FastAPI + Python (APIRouter / Pydantic / Depends / lifespan) |
-| **프론트엔드** | Next.js 15 (App Router) + Tailwind CSS |
+| **프론트엔드** | Next.js 15 (App Router) + Tailwind CSS + NextAuth(Auth.js v5) |
 | **배포 - 백엔드** | AWS EC2 + RDS PostgreSQL |
 | **배포 - 프론트엔드** | Vercel |
 | **모니터링** | LangSmith + CloudWatch |
@@ -52,7 +54,9 @@
 ```
 personal-assistant-agent/
 ├── backend/
-│   ├── main.py                  # FastAPI 진입점 (lifespan + app.state.agent + CORS + 라우터 등록)
+│   ├── main.py                  # FastAPI 진입점 (lifespan + CORS + 라우터 등록) ※SessionMiddleware 불필요(OAuth는 프론트)
+│   ├── config.py                # pydantic-settings (DATABASE_URL, APP_JWT_SECRET 등)
+│   ├── security.py              # 앱 JWT 검증 + get_current_user 의존성 (Depends)
 │   ├── agent/
 │   │   ├── __init__.py
 │   │   ├── agent.py             # create_agent 설정 (middleware 순서: inject_memory → HITL → PII)
@@ -65,26 +69,30 @@ personal-assistant-agent/
 │   │   ├── __init__.py
 │   │   ├── gmail.py             # Gmail API 래퍼 (목록/읽기/초안/발송)
 │   │   ├── calendar.py          # Calendar API 래퍼 (조회/생성)
-│   │   └── oauth.py             # OAuth2 인증 플로우 + 토큰 갱신
+│   │   └── google_auth.py      # accounts의 refresh_token 복원 + access_token 갱신 (google-auth) ※OAuth 플로우는 프론트 NextAuth 담당
 │   ├── db/
 │   │   ├── __init__.py
-│   │   ├── models.py            # 사용자/토큰/선호도 테이블 (SQLAlchemy)
+│   │   ├── models.py            # NextAuth 소유 users/accounts 읽기 매핑 + 선호도 테이블 (인증 테이블 create_all 금지)
 │   │   └── session.py           # DB 세션 (Depends로 주입)
 │   ├── models/                  # ← 요청·응답 Pydantic 모델 (프로젝트 1의 models/ 컨벤션과 일치)
 │   │   ├── __init__.py
 │   │   ├── chat.py              # ChatRequest, ConfirmRequest
-│   │   └── auth.py              # (필요 시) OAuth 관련 응답 모델
+│   │   └── auth.py              # 현재 사용자(/auth/me) 응답 모델
 │   ├── routers/                 # ← 기존 api/ 를 routers/ 로 변경 (APIRouter 그룹화)
 │   │   ├── __init__.py
-│   │   ├── auth.py              # GET /auth/login, GET /auth/callback (OAuth2)
+│   │   ├── auth.py              # GET /auth/me (Bearer 앱 JWT 검증 → 현재 사용자) ※login/callback 없음(NextAuth 담당)
 │   │   ├── chat.py              # POST /chat, POST /chat/confirm
 │   │   └── approval.py          # (선택) GET /pending — 처리 이력 조회용
 │   └── requirements.txt
 ├── frontend/
+│   ├── auth.ts                  # NextAuth(Auth.js v5) 설정: Google Provider + pg-adapter + callbacks(앱 JWT 발급), session.strategy="jwt"
+│   ├── middleware.ts            # 보호 라우트 접근 제어
 │   ├── app/
+│   │   ├── api/auth/[...nextauth]/route.ts  # NextAuth 핸들러 (로그인/콜백/세션)
 │   │   ├── page.tsx             # 채팅 + 비서 메인 화면 (발송 전 인라인 승인 UI 포함)
-│   │   ├── login/page.tsx       # 구글 로그인 화면
-│   │   └── ...
+│   │   └── login/page.tsx       # signIn("google") 구글 로그인 화면
+│   ├── lib/
+│   │   └── api.ts               # fetch 래퍼 (Authorization: Bearer <앱 JWT> 자동 첨부)
 │   └── ...
 └── README.md
 ```
@@ -94,28 +102,49 @@ personal-assistant-agent/
 > - `models/` 디렉터리 신설 : 요청·응답 Pydantic 모델을 라우터에서 분리(프로젝트 1과 동일).
 > - `Context` → `AgentContext` : 클래스명 통일(`ToolRuntime[AgentContext]`, `context_schema=AgentContext`).
 > - `approve.py`(관리자 승인) 제거 → `chat.py`의 `POST /chat/confirm`(본인 확인)으로 대체. 이유는 §5 Phase 5 참고.
+> - **인증을 NextAuth(프론트)로 이동** : 백엔드 `GET /auth/login`·`/auth/callback` 제거. OAuth2 플로우는 NextAuth Google Provider가 전담하고, 구글 `refresh_token`은 `@auth/pg-adapter`가 공유 Postgres `accounts`에 저장. **인증 테이블(`users`/`accounts`/`sessions`)은 NextAuth가 소유·생성**하므로 백엔드는 읽기만 하고 `create_all` 하지 않는다.
+> - **API 인증은 앱 JWT** : NextAuth가 발급한 서명 JWT(HS256, `sub`=`users.id`)를 프론트가 `Authorization: Bearer`로 전달 → FastAPI가 `pyjwt`로 검증(`get_current_user`). 기존 `?email=` 식별 제거.
+> - `integrations/oauth.py` → `google_auth.py` : OAuth 플로우 코드 삭제, **구글 토큰 갱신은 백엔드가 전담**(`accounts`의 refresh_token 복원 + access_token 갱신). NextAuth는 최초 1회 캡처만 담당해 이중 갱신 레이스를 피한다.
 
 ---
 
 ## 4. 시스템 아키텍처 (데이터 흐름)
 
-### 4.1 OAuth2 인증 흐름 (최초 1회)
+### 4.1 인증 흐름 (NextAuth + 앱 JWT)
+
+OAuth2 플로우는 **프론트의 NextAuth**가 전담한다. 백엔드는 NextAuth가 발급한 앱 JWT를 검증하고, `accounts`에 저장된 구글 `refresh_token`을 읽어 Gmail/Calendar를 호출한다.
 
 ```
-구글 로그인 클릭
+[최초 1회 — 로그인 & 권한 위임]
+구글 로그인 클릭 (프론트)
   ↓
-GET /auth/login → 구글 동의 화면으로 리다이렉트
+NextAuth signIn("google") → 구글 동의 화면
+   scope: openid email profile + gmail.modify + gmail.send + calendar
+   access_type=offline, prompt=consent  ← refresh_token 수령 필수
   ↓
-사용자 권한 동의 (Gmail 읽기/쓰기, Calendar)
+사용자 동의 → /api/auth/callback/google (NextAuth가 code→token 교환)
   ↓
-GET /auth/callback → authorization code 수신
+@auth/pg-adapter 가 공유 Postgres에 저장
+   users(id, email, name) / accounts(refresh_token, access_token, expires_at, providerAccountId=구글 sub)
   ↓
-code → access_token + refresh_token 교환
+session.strategy="jwt" → jwt 콜백에서 앱 JWT(HS256, sub=users.id) 발급해 세션에 노출
+
+[이후 매 API 요청]
+프론트 → FastAPI:  Authorization: Bearer <앱 JWT>
   ↓
-refresh_token을 RDS(users 테이블)에 암호화 저장
+FastAPI get_current_user: APP_JWT_SECRET 로 pyjwt 검증 → users.id 추출
   ↓
-이후 요청 시 refresh_token으로 access_token 자동 갱신
+accounts 에서 해당 사용자 refresh_token 읽기
+  ↓
+google-auth로 access_token 갱신(만료 시) → Gmail/Calendar 호출
 ```
+
+> **설계 못 박기 (advisor 점검 반영)**
+> - **adapter 사용 시 `session.strategy`를 반드시 `"jwt"`로 명시**한다. adapter를 붙이면 기본값이 `"database"`가 되고, 그러면 `jwt` 콜백이 실행되지 않아 앱 JWT를 만들 수 없다. `jwt` 전략 + adapter 조합이면 `jwt` 콜백도 돌고, `linkAccount`로 구글 토큰도 `accounts`에 저장돼 양쪽을 모두 얻는다.
+> - **구글 access_token 갱신은 백엔드가 전담**한다. NextAuth는 최초 1회 캡처만, 이후 갱신은 FastAPI가 `refresh_token`으로 수행 — 양쪽이 동시에 갱신하면 토큰 회전 레이스가 난다.
+> - **앱 JWT는 암호화가 아닌 서명(HS256) 토큰**이다. NextAuth 기본 세션 JWT는 JWE(암호화)라 `pyjwt`로 직접 검증할 수 없으므로, 검증 가능한 별도 서명 JWT를 발급해 백엔드에 전달한다.
+> - **인증 테이블 스키마는 NextAuth가 소유**한다. 백엔드는 `users`/`accounts`를 읽기만 하고 생성(`create_all`)하지 않는다.
+> - **토큰 보관 보안(학습 단계 단순화)**: `@auth/pg-adapter`는 `accounts.refresh_token`을 평문 저장한다. 학습 단계라 그대로 두되, 실서비스에서는 컬럼 암호화(pgcrypto)나 암호화 커스텀 adapter를 적용한다.
 
 ### 4.2 사용자 요청 처리 흐름 (런타임)
 
@@ -162,20 +191,30 @@ PII 마스킹 (메일 주소, 전화번호)
 
 ## 5. 구현 단계별 계획
 
-### Phase 1. Google OAuth2 인증 구축
+### Phase 1. NextAuth 구글 로그인 + 공유 토큰 DB + 백엔드 JWT 검증
 
-**목표**: 구글 로그인 → 토큰 저장 → 갱신까지 완성
+**목표**: NextAuth로 구글 로그인 → 구글 토큰을 공유 Postgres에 저장 → 백엔드가 앱 JWT를 검증하고 그 토큰으로 실제 Gmail 호출까지 완성
 
-- [ ] Google Cloud Console에서 OAuth 동의 화면 + 클라이언트 ID 생성
-  - 스코프: `gmail.modify`, `gmail.send`, `calendar`
-- [ ] OAuth2 인증 플로우 구현 (`integrations/oauth.py`)
-  - `GET /auth/login` → 동의 화면 리다이렉트
-  - `GET /auth/callback` → code → token 교환
-  - 라우트는 `routers/auth.py`(APIRouter)에 정의, 로직은 `integrations/oauth.py`에 분리
-- [ ] users / oauth_tokens 테이블 정의 (`db/models.py`) + 세션 주입 (`db/session.py`, FastAPI `Depends`)
-  - refresh_token은 Fernet 등으로 암호화 저장
-- [ ] access_token 자동 갱신 로직 구현
-- **검증**: 구글 로그인 후 RDS에 refresh_token 저장 + 만료 시 자동 갱신 확인
+**프론트 (NextAuth / Auth.js v5)**
+- [ ] Google Cloud Console에서 OAuth 동의 화면 + 웹 클라이언트 ID 생성
+  - 스코프: `openid email profile`, `gmail.modify`, `gmail.send`, `calendar`
+  - **승인된 리디렉션 URI**: `http://localhost:3000/api/auth/callback/google` (NextAuth 콜백)
+- [ ] `auth.ts` 작성: Google Provider + `@auth/pg-adapter`(공유 Postgres) + `session.strategy="jwt"`
+  - `authorization.params`: `access_type=offline`, `prompt=consent` (refresh_token 수령)
+  - `callbacks.jwt`/`callbacks.session`: 앱 JWT(HS256, `sub`=`users.id`)를 `APP_JWT_SECRET`로 서명해 세션에 노출
+- [ ] `app/api/auth/[...nextauth]/route.ts` + `login/page.tsx`(`signIn("google")`)
+- [ ] `lib/api.ts`: FastAPI 호출 시 `Authorization: Bearer <앱 JWT>` 자동 첨부
+
+**백엔드 (FastAPI)**
+- [ ] `config.py`(pydantic-settings): `DATABASE_URL`, `APP_JWT_SECRET`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`(토큰 갱신용)
+- [ ] `db/models.py`: NextAuth가 만든 `users`/`accounts`에 대한 **읽기 매핑** (인증 테이블은 `create_all` 금지 — NextAuth가 소유) + 세션 주입(`db/session.py`, `Depends`)
+- [ ] `security.py`: `get_current_user` 의존성 — `APP_JWT_SECRET`로 `pyjwt` 검증 → `users.id` 추출
+- [ ] `integrations/google_auth.py`: `accounts`의 refresh_token 복원 → `google-auth`로 access_token 갱신(백엔드 전담) → `build("gmail",...)`
+- [ ] `routers/auth.py`: `GET /auth/me` — Bearer JWT 검증 후 저장된 토큰으로 Gmail 프로필 호출(E2E 검증)
+- **검증**:
+  - 구글 로그인 후 `accounts`에 refresh_token 저장 확인
+  - 프론트가 `Bearer <앱 JWT>`로 `/auth/me` 호출 → 실제 Gmail 프로필 반환
+  - access_token 만료를 강제해도 백엔드가 자동 갱신 후 정상 응답
 
 ---
 
@@ -379,27 +418,27 @@ PII 마스킹 (메일 주소, 전화번호)
 - [ ] 키페어 생성 (`chmod 400 your-key.pem`)
 - [ ] Elastic IP 할당 (고정 IP → 구글 OAuth 리다이렉트 URI 등록에 필요)
 
-#### 8-6. 도메인 + HTTPS 설정 (OAuth 콜백 필수)
+#### 8-6. 도메인 + HTTPS 설정
 
-- [ ] 도메인 연결 (Route 53 또는 외부 도메인)
-- [ ] Nginx 리버스 프록시 + Let's Encrypt(certbot)로 HTTPS 인증서 발급
+- [ ] 백엔드 도메인 연결 (Route 53 또는 외부 도메인) — Bearer 토큰을 TLS로 보호
+- [ ] Nginx 리버스 프록시 + Let's Encrypt(certbot)로 HTTPS 인증서 발급 (`https://api.your-domain.com`)
+- [ ] **OAuth 콜백은 프론트(NextAuth)** : Google Cloud Console의 **승인된 리디렉션 URI**에 Vercel 프론트 도메인 등록
   ```
-  https://your-domain.com/auth/callback
+  https://your-app.vercel.app/api/auth/callback/google
   ```
-- [ ] Google Cloud Console의 **승인된 리디렉션 URI**에 위 콜백 URL 등록
+  (Vercel은 기본 HTTPS이므로 별도 인증서 작업 불필요)
 
 #### 8-7. EC2에 FastAPI 배포
 
 - [ ] SSH 접속 후 패키지 설치 (`python3.11`, `git`, `nginx`)
 - [ ] 프로젝트 클론 및 `pip install -r requirements.txt`
-- [ ] 환경변수 설정
+- [ ] 환경변수 설정 (백엔드도 구글 토큰 **갱신**을 위해 client_id/secret 필요 — 갱신 요청에 클라이언트 자격증명이 들어간다)
   ```bash
   export OPENAI_API_KEY="sk-..."
-  export DATABASE_URL="postgresql://postgres:password@rds-endpoint:5432/assistant_db"
-  export GOOGLE_CLIENT_ID="..."
-  export GOOGLE_CLIENT_SECRET="..."
-  export OAUTH_REDIRECT_URI="https://your-domain.com/auth/callback"
-  export TOKEN_ENCRYPTION_KEY="..."   # Fernet 키
+  export DATABASE_URL="postgresql+psycopg://postgres:password@rds-endpoint:5432/assistant_db"
+  export APP_JWT_SECRET="..."         # NextAuth와 공유 (JWT 서명/검증 동일 키)
+  export GOOGLE_CLIENT_ID="..."       # access_token 갱신 시 필요
+  export GOOGLE_CLIENT_SECRET="..."   # access_token 갱신 시 필요
   export TAVILY_API_KEY="..."
   export LANGSMITH_API_KEY="ls_..."
   ```
@@ -414,9 +453,18 @@ PII 마스킹 (메일 주소, 전화번호)
 - [ ] `.github/workflows/deploy.yml` (push 시 EC2 SSH → git pull → 의존성 설치 → 서비스 재시작)
 - [ ] GitHub Secrets: `EC2_HOST`, `EC2_KEY`
 
-#### 8-10. 프론트엔드 Vercel 배포
+#### 8-10. 프론트엔드 Vercel 배포 (NextAuth)
 
-- [ ] 환경변수 `NEXT_PUBLIC_API_URL=https://your-domain.com`
+- [ ] 환경변수
+  ```bash
+  NEXT_PUBLIC_API_URL=https://api.your-domain.com
+  AUTH_SECRET=...                 # NextAuth 세션 암호화 키
+  AUTH_GOOGLE_ID=...              # 구글 OAuth 클라이언트 ID
+  AUTH_GOOGLE_SECRET=...          # 구글 OAuth 시크릿
+  APP_JWT_SECRET=...              # 백엔드와 공유 (앱 JWT 서명)
+  DATABASE_URL=postgresql://...   # @auth/pg-adapter용 (백엔드와 동일 RDS)
+  ```
+- [ ] Google Console 승인된 리디렉션 URI에 `https://your-app.vercel.app/api/auth/callback/google` 등록
 - [ ] `vercel --prod`
 
 #### 8-11. CloudWatch 모니터링
@@ -425,7 +473,7 @@ PII 마스킹 (메일 주소, 전화번호)
 
 #### 8-12. 검증 및 테스트
 
-- [ ] HTTPS로 구글 로그인 → 콜백 → 토큰 저장 확인
+- [ ] Vercel 프론트에서 NextAuth 구글 로그인 → `accounts`에 토큰 저장 → 앱 JWT 발급 확인
 - [ ] 메일 조회 → 분석 → 답장 초안 → 본인 확인 → 실제 발송 E2E
 - [ ] Vercel 프론트 → EC2 백엔드 통신 확인
 
@@ -456,25 +504,26 @@ PII 마스킹 (메일 주소, 전화번호)
 
 ## 6. API 설계
 
+> 로그인/콜백(`/api/auth/*`)은 **프론트 NextAuth가 처리**하므로 백엔드 엔드포인트가 아니다.
+> 아래 백엔드 엔드포인트는 모두 `Authorization: Bearer <앱 JWT>`를 요구한다(`get_current_user`).
+
 | Method | Endpoint | 설명 |
 | :--- | :--- | :--- |
-| `GET` | `/auth/login` | 구글 OAuth2 동의 화면으로 리다이렉트 |
-| `GET` | `/auth/callback` | code 수신 → 토큰 교환·저장 |
+| `GET` | `/auth/me` | 앱 JWT 검증 → 현재 사용자 + 저장된 토큰으로 Gmail 프로필(E2E 검증) |
 | `POST` | `/chat` | 사용자 요청 전송 → 에이전트 응답 (발송 시 `confirmation_required`) |
 | `POST` | `/chat/confirm` | 사용자 본인 확인 후 에이전트 재개 (`Command(resume=...)`) |
 | `GET` | `/pending` | (선택) 발송/일정 처리 이력 조회 — 감사 로그용 |
 
-> 기존 plan의 `GET /pending` + `POST /approve`(관리자 비동기 승인)는 제거.
-> 발송 승인자가 사용자 본인이므로 `POST /chat/confirm`(동기 재개) 한 엔드포인트로 충분하다.
+> 기존 plan의 `GET /auth/login`·`/auth/callback`(백엔드 OAuth)은 제거 → NextAuth로 이동.
+> `GET /pending` + `POST /approve`(관리자 비동기 승인)도 제거 — 발송 승인자가 사용자 본인이므로 `POST /chat/confirm`(동기 재개) 한 엔드포인트로 충분하다.
 
 ### POST /chat 요청/응답 예시
 
 ```json
-// Request
+// Request  (헤더: Authorization: Bearer <앱 JWT> — user_id는 JWT의 sub에서 서버가 도출)
 {
   "message": "오늘 안 읽은 메일 정리하고 김부장님 메일엔 답장 초안 써줘",
-  "thread_id": "session-abc123",
-  "user_id": "user-001"
+  "thread_id": "session-abc123"
 }
 
 // Response (확인 불필요 - 조회만)
@@ -514,9 +563,9 @@ PII 마스킹 (메일 주소, 전화번호)
 ### POST /chat/confirm 요청 예시
 
 ```json
+// 헤더: Authorization: Bearer <앱 JWT> (user_id는 JWT sub에서 도출)
 {
   "thread_id": "session-abc123",
-  "user_id": "user-001",
   "decision": "approve",          // "approve" | "edit" | "reject"
   "edited_content": null           // decision="edit"일 때만 수정된 본문
 }
@@ -531,7 +580,8 @@ PII 마스킹 (메일 주소, 전화번호)
 | "이 에이전트가 왜 안전한가요?" | 모든 부수효과 작업(메일 발송, 일정 생성)에 `HumanInTheLoopMiddleware`로 interrupt를 강제. 조회는 자동, 쓰기는 반드시 사용자 본인 확인(resume) 후 실행. LLM이 단독으로 외부에 영향을 줄 수 없는 구조 |
 | "HITL을 어떻게 구현했나요?" | 도구 안에 `interrupt()`를 직접 쓰지 않고 미들웨어가 선언적으로 제어. `__interrupt__`를 `result["messages"][-1]` 접근 전에 감지해 `confirmation_required` 반환, `Command(resume={"decisions":[{"type": decision}]})`로 재개. interrupt 상태는 checkpointer가 thread_id로 보관 |
 | "왜 관리자 승인 큐가 없나요?" | 발송 승인자가 사용자 본인이고 채팅창 앞에 있으므로 동기 interrupt/resume 한 흐름이면 충분. 프로젝트 1처럼 제3자(관리자)가 비동기로 승인하는 경우에만 별도 store + `/approve`가 필요 |
-| "OAuth2 토큰은 어떻게 관리하나요?" | refresh_token을 Fernet로 암호화해 RDS에 저장. access_token은 만료 시 자동 갱신. 콜백은 HTTPS에서만 처리해 토큰 탈취 방지 |
+| "로그인/OAuth는 어떻게 처리하나요?" | OAuth2 플로우는 프론트 NextAuth(Auth.js v5) Google Provider가 전담. `access_type=offline`로 받은 구글 refresh_token은 `@auth/pg-adapter`가 공유 Postgres `accounts`에 저장. 백엔드는 이 토큰을 읽어 access_token을 **백엔드가 전담 갱신**(이중 갱신 레이스 방지) |
+| "프론트(NextAuth)와 파이썬 백엔드 인증을 어떻게 잇나요?" | NextAuth 기본 세션 토큰은 JWE(암호화)라 `pyjwt`로 검증 불가. 그래서 NextAuth `jwt` 콜백에서 **별도 서명 JWT(HS256, `sub`=`users.id`)** 를 `APP_JWT_SECRET`로 발급해 `Authorization: Bearer`로 전달 → FastAPI가 `pyjwt`로 검증(`get_current_user`). adapter 사용 시 `session.strategy="jwt"`를 명시해야 `jwt` 콜백이 동작 |
 | "왜 Structured Output(EmailAnalysis)을 쓰나요?" | 메일 분류 결과를 의도·감정·우선순위 스키마로 강제하면 후속 로직(우선순위 정렬, 자동 라벨링)이 안정적. 자유 텍스트 파싱의 깨짐을 제거 |
 | "inject_memory를 왜 async로 작성하나요?" | chat.py가 `ainvoke`로 실행하므로 `@wrap_model_call`을 sync로 정의하면 `awrap_model_call`이 `NotImplementedError`를 발생. 반드시 `async def` + `await handler(request)`, base 프롬프트 보존 |
 | "Agent 인스턴스는 어떻게 관리하나요?" | 모듈 레벨 싱글톤(`get_agent()`)으로 생성해 `checkpointer`/`store` 상태를 보존(요청마다 새로 만들면 단기 기억·interrupt 상태 유실). 테스트 용이성이 필요하면 `app.state.agent` + `Depends(get_agent)`로 전환 가능 |
@@ -546,7 +596,7 @@ PII 마스킹 (메일 주소, 전화번호)
 
 | Phase | 내용 | 예상 기간 |
 | :---: | :--- | :---: |
-| 1 | Google OAuth2 인증 구축 | 3일 |
+| 1 | NextAuth 구글 로그인 + 공유 토큰 DB + 백엔드 JWT 검증 | 3일 |
 | 2 | Gmail / Calendar Tool 연결 | 3일 |
 | 3 | Structured Output (EmailAnalysis) | 1일 |
 | 4 | TodoList Middleware + Memory | 2일 |
@@ -559,4 +609,4 @@ PII 마스킹 (메일 주소, 전화번호)
 |   | - 배포 + GitHub Actions CI/CD | 1.5일 |
 | **합계** | | **약 20일** |
 
-**추가 학습**: Google OAuth2 플로우, Gmail/Calendar API 스코프, Nginx + Let's Encrypt HTTPS 설정 포함
+**추가 학습**: NextAuth(Auth.js v5) Google Provider + adapter, 앱 JWT(HS256) 발급/검증, Gmail/Calendar API 스코프, Nginx + Let's Encrypt HTTPS 설정 포함
