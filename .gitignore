@@ -38,3 +38,6 @@ Thumbs.db
 
 # Git worktrees (Claude Code)
 .claude/worktrees/
+
+# Superpowers brainstorming companion (scratch)
+.superpowers/
