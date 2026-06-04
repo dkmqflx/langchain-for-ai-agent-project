@@ -7,6 +7,7 @@ from langchain_core.messages import AIMessageChunk, ToolMessage
 from langgraph.types import Interrupt
 
 from agent.streaming import (
+    extract_block_reason,
     extract_interrupt_action,
     is_final_answer_chunk,
     is_search_tool_result,
@@ -78,3 +79,28 @@ def test_extracts_first_action():
 
 def test_no_interrupt_returns_none():
     assert extract_interrupt_action({"model": {"messages": []}}) is None
+
+
+# --- extract_block_reason ---
+# updates payload 구조는 probe로 확인: {노드이름: {jump_to, blocked, block_reason, messages}}
+def test_extracts_block_reason():
+    payload = {
+        "block_inappropriate_input.before_agent": {
+            "jump_to": "end",
+            "blocked": True,
+            "block_reason": "부적절한 언어가 포함되어 있어 처리할 수 없습니다. 다시 문의해 주세요.",
+            "messages": [],
+        }
+    }
+    assert extract_block_reason(payload) == (
+        "부적절한 언어가 포함되어 있어 처리할 수 없습니다. 다시 문의해 주세요."
+    )
+
+
+def test_no_block_returns_none():
+    assert extract_block_reason({"model": {"messages": []}}) is None
+
+
+def test_block_false_returns_none():
+    # blocked 키가 있어도 falsy면 차단 아님
+    assert extract_block_reason({"model": {"blocked": False}}) is None

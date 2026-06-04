@@ -1,5 +1,8 @@
 """
 미들웨어 실행 순서 (에이전트 내부):
+  block_inappropriate_input: before_agent 훅 — 진입 시 1회. 욕설/부적절 입력이면
+                            모델 호출 없이 jump_to="end"로 단락하고 state["blocked"]=True 설정.
+                            (모든 진입점 /chat·/chat/stream에 자동 적용 — 라우터 중복 제거)
   inject_memory:            wrap_model_call 훅 — 모델 호출을 감싸 system_prompt에 선호도 주입
   HumanInTheLoopMiddleware: after_model 훅 — 모델이 submit_refund_request 도구 호출을 내면
                             실행 직전에 interrupt()로 일시정지 (사용자 본인 확인 대기)
@@ -24,7 +27,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.store.memory import InMemoryStore
 
 from agent.context import AgentContext
-from agent.middleware import SYSTEM_PROMPT, inject_memory
+from agent.middleware import SYSTEM_PROMPT, block_inappropriate_input, inject_memory
 from agent.tools import (
     get_user_preferences,
     save_user_preference,
@@ -46,6 +49,7 @@ _agent = create_agent(
     tools=[search_documents, save_user_preference, get_user_preferences, submit_refund_request],
     system_prompt=SYSTEM_PROMPT,
     middleware=[
+        block_inappropriate_input,  # Before Guardrail: 욕설 입력 시 모델 호출 없이 단락
         inject_memory,
         HumanInTheLoopMiddleware(
             interrupt_on={

@@ -15,8 +15,9 @@ from sse_starlette import EventSourceResponse
 
 from agent.agent import get_agent
 from agent.context import AgentContext
-from agent.middleware import check_hallucination, is_blocked_input
+from agent.middleware import check_hallucination
 from agent.streaming import (
+    extract_block_reason,
     extract_interrupt_action,
     is_final_answer_chunk,
     is_search_tool_result,
@@ -45,35 +46,24 @@ async def chat(request: ChatRequest):
     고객 메시지를 미들웨어 파이프라인을 통해 처리하고 안전한 답변을 반환.
 
     흐름:
-      1. Before Guardrail: 욕설 차단 → 차단 시 즉시 반환
-      2. Agent 실행 (내부에서 inject_memory, HumanInTheLoopMiddleware, PIIMiddleware 자동 실행)
-      2-1. Human-in-the-loop interrupt 감지 → 사용자 본인 확인 요청으로 즉시 반환
-      3. 검색 컨텍스트 추출 (search_documents ToolMessage 수집)
-      4. After Guardrail: 할루시네이션 검증 (컨텍스트 있을 때만)
+      1. Agent 실행 (내부에서 block_inappropriate_input(Before Guardrail), inject_memory,
+         HumanInTheLoopMiddleware, PIIMiddleware 자동 실행)
+      1-1. Before Guardrail 차단 감지 → 차단 응답으로 즉시 반환
+      1-2. Human-in-the-loop interrupt 감지 → 사용자 본인 확인 요청으로 즉시 반환
+      2. 검색 컨텍스트 추출 (search_documents ToolMessage 수집)
+      3. After Guardrail: 할루시네이션 검증 (컨텍스트 있을 때만)
 
     Returns:
         status="completed":             정상 처리
-        status="blocked":               Before Guardrail에 의해 차단됨
+        status="blocked":               Before Guardrail(욕설 차단 미들웨어)에 의해 차단됨
         status="confirmation_required": 환불 신청 등 → 사용자 본인 확인 필요 (POST /chat/confirm로 재개)
     """
     try:
-        # [1] Before Guardrail: 욕설/부적절 콘텐츠 차단
-        blocked, reason = is_blocked_input(request.message)
-        if blocked:
-            return {
-                "data": {
-                    "response": reason,
-                    "thread_id": request.thread_id,
-                    "status": "blocked",
-                },
-                "isSuccess": True,
-                "code": "SUCCESS",
-                "message": "Chat completed successfully",
-            }
-
         agent = get_agent()
 
-        # [2] Agent 실행
+        # [1] Agent 실행
+        # 욕설 차단(Before Guardrail)은 이제 에이전트 내부 block_inappropriate_input
+        # 미들웨어가 담당한다. 차단 시 모델 호출 없이 단락되며 result["blocked"]=True가 된다.
         # thread_id: checkpointer용 (단기 기억)
         # context:   AgentContext로 user_id 전달 → inject_memory + ToolRuntime에서 사용
         result = await agent.ainvoke(
@@ -82,7 +72,22 @@ async def chat(request: ChatRequest):
             context=AgentContext(user_id=request.user_id),
         )
 
-        # [2-1] Human-in-the-loop interrupt 감지 (사용자 본인 확인)
+        # [1-1] Before Guardrail 차단 감지
+        # 미들웨어가 욕설을 차단하면 모델/도구를 건너뛰고 단락하며,
+        # state에 blocked=True와 block_reason(거절 메시지)을 남긴다.
+        if result.get("blocked"):
+            return {
+                "data": {
+                    "response": result.get("block_reason", ""),
+                    "thread_id": request.thread_id,
+                    "status": "blocked",
+                },
+                "isSuccess": True,
+                "code": "SUCCESS",
+                "message": "Chat completed successfully",
+            }
+
+        # [1-2] Human-in-the-loop interrupt 감지 (사용자 본인 확인)
         # submit_refund_request 호출 시 HumanInTheLoopMiddleware가 일시정지시킴.
         # 반드시 result["messages"][-1] 접근 전에 분기할 것:
         #   interrupt 시 마지막 메시지는 tool_call을 담은 AIMessage(content 비어있음)이므로
@@ -128,7 +133,7 @@ async def chat(request: ChatRequest):
         # 예: "고객님, 환불은 30일 이내에 가능합니다."
         ai_message = result["messages"][-1].content
 
-        # [3] 검색 컨텍스트 추출
+        # [2] 검색 컨텍스트 추출
         # Agent 실행 중 여러 tool이 호출될 수 있음 (submit_refund_request, search_documents 등)
         # 이 중에서 search_documents 결과만 필터링하여 리스트로 수집
         # 예: ["문서A 내용...", "문서B 내용..."]
@@ -138,7 +143,7 @@ async def chat(request: ChatRequest):
             if isinstance(msg, ToolMessage) and msg.name == "search_documents"
         ]
 
-        # [4] After Guardrail: 할루시네이션 검증
+        # [3] After Guardrail: 할루시네이션 검증
         # AI 답변이 실제 검색된 문서와 일치하는지 확인
         # 검색 결과가 있을 때만 검증 (RAG 기반 답변만 검증)
         if search_contexts:
@@ -256,7 +261,8 @@ async def chat_stream(request: ChatRequest):
     """고객 메시지를 SSE로 스트리밍 처리한다.
 
     단일 엔드포인트가 agent.astream 을 관찰하며 내부 분기한다:
-      - 욕설 차단      → event:blocked 후 종료 (에이전트 미실행)
+      - 욕설 차단      → event:blocked 후 종료
+        (에이전트 내부 block_inappropriate_input 미들웨어가 단락 → updates 스트림에서 감지)
       - 일반 답변      → event:token 으로 토큰 실시간 전송
       - RAG 답변(검색) → 토큰 버퍼링 → 할루시네이션 검사본을 event:message 1회 전송
       - 환불 interrupt → event:confirmation_required 후 종료 (재개는 기존 POST /chat/confirm)
@@ -277,18 +283,6 @@ async def chat_stream(request: ChatRequest):
 
     async def event_generator():
         try:
-            # [1] Before Guardrail: 욕설/부적절 입력 차단 (에이전트 실행 전)
-            blocked, reason = is_blocked_input(request.message)
-            if blocked:
-                yield {
-                    "event": "blocked",
-                    "data": json.dumps(
-                        {"response": reason, "thread_id": request.thread_id},
-                        ensure_ascii=False,
-                    ),
-                }
-                return
-
             agent = get_agent()
             config = {"configurable": {"thread_id": request.thread_id}}
 
@@ -296,9 +290,12 @@ async def chat_stream(request: ChatRequest):
             search_contexts: list[str] = []  # 할루시네이션 검사용 검색 컨텍스트
             answer_buffer: list[str] = []    # 검색 사용 시 최종 답변 토큰 버퍼
             interrupt_action = None          # 환불 interrupt action {name,args}
+            blocked_reason = None            # Before Guardrail 차단 사유
 
-            # [2] astream 으로 실행하며 관찰
-            # stream_mode=["updates","messages"]: 토큰(messages) + interrupt(updates) 동시 수신
+            # [1] astream 으로 실행하며 관찰
+            # 욕설 차단(Before Guardrail)은 에이전트 내부 미들웨어가 담당하므로,
+            # updates 스트림에서 blocked 신호를 감지한다 (라우터 선검사 불필요).
+            # stream_mode=["updates","messages"]: 토큰(messages) + 차단/interrupt(updates) 동시 수신
             async for mode, payload in agent.astream(
                 {"messages": [("human", request.message)]},
                 config=config,
@@ -306,6 +303,10 @@ async def chat_stream(request: ChatRequest):
                 stream_mode=["updates", "messages"],
             ):
                 if mode == "updates":
+                    reason = extract_block_reason(payload)
+                    if reason is not None:
+                        blocked_reason = reason
+                        break  # 욕설 차단 → 스트림 중단
                     action = extract_interrupt_action(payload)
                     if action is not None:
                         interrupt_action = action
@@ -328,7 +329,17 @@ async def chat_stream(request: ChatRequest):
                                 ),
                             }
 
-            # [3] 스트림 종료 후 분기
+            # [2] 스트림 종료 후 분기
+            if blocked_reason is not None:
+                yield {
+                    "event": "blocked",
+                    "data": json.dumps(
+                        {"response": blocked_reason, "thread_id": request.thread_id},
+                        ensure_ascii=False,
+                    ),
+                }
+                return
+
             if interrupt_action is not None:
                 yield {
                     "event": "confirmation_required",
