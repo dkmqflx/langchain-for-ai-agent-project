@@ -1,0 +1,19 @@
+# 환경변수 (실제 값이 들어간 파일은 git에서 제외)
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Node
+node_modules/
+.next/
+
+# 기타
+.DS_Store
