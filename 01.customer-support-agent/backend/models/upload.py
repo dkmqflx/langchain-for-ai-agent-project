@@ -7,9 +7,10 @@ class UploadData(BaseModel):
 
 
 class UploadResponse(BaseModel):
-    success: bool
+    data: UploadData
+    isSuccess: bool = True
+    code: str = "SUCCESS"
     message: str
-    data: UploadData | None = None
 
 
 class DocumentItem(BaseModel):
@@ -22,6 +23,7 @@ class DocumentsData(BaseModel):
 
 
 class DocumentsResponse(BaseModel):
-    success: bool
+    data: DocumentsData
+    isSuccess: bool = True
+    code: str = "SUCCESS"
     message: str
-    data: DocumentsData | None = None

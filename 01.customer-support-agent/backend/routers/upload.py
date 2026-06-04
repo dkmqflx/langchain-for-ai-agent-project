@@ -7,15 +7,19 @@ RAG 파이프라인 Step 5: 업로드 API (Upload Endpoint)
   - 업로드된 문서 목록 조회 기능
 
 엔드포인트:
+  공통 응답 형식(envelope): {data, isSuccess, code, message}
+    - 성공: code="SUCCESS"
+    - 실패: code="HTTP_<상태코드>" 또는 "VALIDATION_ERROR", data=null
+
   POST /upload
     - 파일(PDF/TXT) 업로드 → RAG 파이프라인 실행
-    - 성공: {"success": true, "message": "...", "data": {"filename": "...", "chunks": 47}}
-    - 실패: {"success": false, "message": "...", "data": null}
+    - 성공: {"data": {"filename": "...", "chunks": 47}, "isSuccess": true, "code": "SUCCESS", "message": "..."}
+    - 실패: {"data": null, "isSuccess": false, "code": "HTTP_500", "message": "..."}
 
   GET /documents
     - 업로드된 문서 목록 조회
-    - 성공: {"success": true, "message": "...", "data": {"documents": [...]}}
-    - 실패: {"success": false, "message": "...", "data": null}
+    - 성공: {"data": {"documents": [...]}, "isSuccess": true, "code": "SUCCESS", "message": "..."}
+    - 실패: {"data": null, "isSuccess": false, "code": "HTTP_500", "message": "..."}
 
 파일 처리 흐름:
   1. 브라우저에서 파일 선택
@@ -33,6 +37,7 @@ import tempfile
 from fastapi import APIRouter, HTTPException, UploadFile
 
 from agent.tools import build_bm25
+from models.common import ErrorResponse
 from models.upload import DocumentsResponse, UploadResponse
 from rag.loader import load_document
 from rag.splitter import split_documents
@@ -46,7 +51,16 @@ router = APIRouter(tags=["Documents"])
 ALLOWED_EXTENSIONS = {".pdf", ".txt"}
 
 
-@router.post("/upload", response_model=UploadResponse, status_code=201)
+@router.post(
+    "/upload",
+    response_model=UploadResponse,
+    status_code=201,
+    responses={
+        400: {"model": ErrorResponse, "description": "지원하지 않는 파일 형식 (.pdf/.txt 외)"},
+        422: {"model": ErrorResponse, "description": "요청 검증 실패 (파일 누락 등)"},
+        500: {"model": ErrorResponse, "description": "RAG 파이프라인 처리 실패"},
+    },
+)
 async def upload_document(file: UploadFile):
     """
     파일 업로드 → Step 1~4 자동 실행.
@@ -65,19 +79,21 @@ async def upload_document(file: UploadFile):
 
     Returns (성공):
         {
-            "success": true,
-            "message": "File uploaded successfully",
             "data": {
                 "filename": "manual.pdf",
                 "chunks": 47
-            }
+            },
+            "isSuccess": true,
+            "code": "SUCCESS",
+            "message": "File uploaded successfully"
         }
 
     Returns (실패):
         {
-            "success": false,
-            "message": "에러 메시지",
-            "data": null
+            "data": null,
+            "isSuccess": false,
+            "code": "HTTP_500",
+            "message": "에러 메시지"
         }
 
     Example:
@@ -87,7 +103,7 @@ async def upload_document(file: UploadFile):
         const res = await fetch('/upload', { method: 'POST', body: formData });
         const json = await res.json();
 
-        if (json.success) {
+        if (json.isSuccess) {
             console.log(`${json.data.chunks}개 청크 저장됨`);
         } else {
             console.error(json.message);
@@ -132,12 +148,13 @@ async def upload_document(file: UploadFile):
 
         # [5] 성공 응답
         return {
-            "success": True,
-            "message": "File uploaded successfully",
             "data": {
                 "filename": file.filename,
                 "chunks": len(ids),
-            }
+            },
+            "isSuccess": True,
+            "code": "SUCCESS",
+            "message": "File uploaded successfully",
         }
 
     except HTTPException:
@@ -161,7 +178,13 @@ async def upload_document(file: UploadFile):
         os.unlink(tmp_path)  # 임시 파일 삭제
 
 
-@router.get("/documents", response_model=DocumentsResponse)
+@router.get(
+    "/documents",
+    response_model=DocumentsResponse,
+    responses={
+        500: {"model": ErrorResponse, "description": "문서 목록 조회 실패"},
+    },
+)
 async def list_documents():
     """
     업로드된 문서 목록 조회.
@@ -171,21 +194,23 @@ async def list_documents():
 
     Returns (성공):
         {
-            "success": true,
-            "message": "Documents retrieved successfully",
             "data": {
                 "documents": [
                     {"filename": "manual.pdf", "uploaded_at": "2026-05-27T..."},
                     {"filename": "faq.txt", "uploaded_at": "2026-05-26T..."}
                 ]
-            }
+            },
+            "isSuccess": true,
+            "code": "SUCCESS",
+            "message": "Documents retrieved successfully"
         }
 
     Returns (실패):
         {
-            "success": false,
-            "message": "에러 메시지",
-            "data": null
+            "data": null,
+            "isSuccess": false,
+            "code": "HTTP_500",
+            "message": "에러 메시지"
         }
 
     Note:
@@ -197,7 +222,7 @@ async def list_documents():
         const res = await fetch('/documents');
         const json = await res.json();
 
-        if (json.success) {
+        if (json.isSuccess) {
             json.data.documents.forEach(doc => {
                 console.log(`${doc.filename} (${doc.uploaded_at})`);
             });
@@ -220,11 +245,12 @@ async def list_documents():
                 }
 
         return {
-            "success": True,
-            "message": "Documents retrieved successfully",
             "data": {
                 "documents": list(sources.values())
-            }
+            },
+            "isSuccess": True,
+            "code": "SUCCESS",
+            "message": "Documents retrieved successfully",
         }
 
     except Exception as e:

@@ -52,9 +52,10 @@ ChatData = Annotated[
 # ── Response models ───────────────────────────────────────────────────────────
 
 class ChatResponse(BaseModel):
-    success: bool
-    message: str
     data: ChatData
+    isSuccess: bool = True
+    code: str = "SUCCESS"
+    message: str
 
 
 class ConfirmData(BaseModel):
@@ -64,6 +65,7 @@ class ConfirmData(BaseModel):
 
 
 class ConfirmResponse(BaseModel):
-    success: bool
-    message: str
     data: ConfirmData
+    isSuccess: bool = True
+    code: str = "SUCCESS"
+    message: str

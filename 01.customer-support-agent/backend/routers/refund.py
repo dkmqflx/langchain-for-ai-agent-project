@@ -47,9 +47,10 @@ async def list_pending_refunds():
     """(관리자) 승인 대기(pending) 중인 환불 신청 목록."""
     pending = [_to_item(r) for r in list_pending()]
     return {
-        "success": True,
-        "message": "Pending refund requests retrieved successfully",
         "data": {"pending": pending},
+        "isSuccess": True,
+        "code": "SUCCESS",
+        "message": "Pending refund requests retrieved successfully",
     }
 
 
@@ -72,9 +73,10 @@ async def decide_refund(request: AdminDecisionRequest):
 
     updated = set_decision(request.refund_id, request.decision)
     return {
-        "success": True,
-        "message": "Refund decision applied successfully",
         "data": _to_item(updated),
+        "isSuccess": True,
+        "code": "SUCCESS",
+        "message": "Refund decision applied successfully",
     }
 
 
@@ -83,7 +85,8 @@ async def my_refunds(user_id: str):
     """(사용자) 본인이 신청한 환불 목록과 상태를 조회한다 (마이페이지용)."""
     refunds = [_to_item(r) for r in list_by_user(user_id)]
     return {
-        "success": True,
-        "message": "Refund requests retrieved successfully",
         "data": {"refunds": refunds},
+        "isSuccess": True,
+        "code": "SUCCESS",
+        "message": "Refund requests retrieved successfully",
     }

@@ -29,6 +29,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 # .env 파일은 backend의 상위(customer-support-agent/) 디렉토리에 위치
@@ -36,6 +37,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 from fastapi.middleware.cors import CORSMiddleware
 
 from agent.tools import build_bm25
+from models.common import ErrorResponse
 from routers.chat import router as chat_router
 from routers.refund import router as refund_router
 from routers.upload import router as upload_router
@@ -82,16 +84,42 @@ app.add_middleware(
 )
 
 # 전역 HTTPException 핸들러
-# 모든 HTTPException을 프로젝트 공통 응답 형식으로 변환
+# 모든 HTTPException을 프로젝트 공통 응답 형식({data, isSuccess, code, message})으로 변환
+# code: "HTTP_<상태코드>" (예: HTTP_400, HTTP_404, HTTP_500)
+# message: HTTPException의 detail 문자열
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "success": False,
-            "message": exc.detail,
-            "data": None,
-        }
+        content=ErrorResponse(
+            code=f"HTTP_{exc.status_code}",
+            message=str(exc.detail),
+        ).model_dump(),
+    )
+
+
+def _format_validation_errors(exc: RequestValidationError) -> str:
+    """RequestValidationError의 상세 정보를 'loc: msg; ...' 형태의 문자열로 변환."""
+    parts = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", []))
+        msg = err.get("msg", "")
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return "; ".join(p for p in parts if p) or "Validation error"
+
+
+# 전역 RequestValidationError 핸들러
+# 요청 검증 실패(예: 필수 파일/필드 누락)는 HTTPException이 아니므로 별도 핸들러가 필요하다.
+# FastAPI 기본 형식({"detail": [...]})을 프로젝트 공통 봉투로 통일한다.
+# code: "VALIDATION_ERROR", message: 어떤 필드가 왜 틀렸는지 요약한 상세 문자열
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content=ErrorResponse(
+            code="VALIDATION_ERROR",
+            message=_format_validation_errors(exc),
+        ).model_dump(),
     )
 
 

@@ -53,13 +53,14 @@ async def chat(request: ChatRequest):
         blocked, reason = is_blocked_input(request.message)
         if blocked:
             return {
-                "success": True,
-                "message": "Chat completed successfully",
                 "data": {
                     "response": reason,
                     "thread_id": request.thread_id,
                     "status": "blocked",
                 },
+                "isSuccess": True,
+                "code": "SUCCESS",
+                "message": "Chat completed successfully",
             }
 
         agent = get_agent()
@@ -105,13 +106,14 @@ async def chat(request: ChatRequest):
             #   [0]                                   → 첫 번째 action 딕셔너리
             action = interrupts[0].value["action_requests"][0]
             return {
-                "success": True,
-                "message": "Confirmation required",
                 "data": {
                     "thread_id": request.thread_id,
                     "status": "confirmation_required",
                     "confirmation": {"tool": action["name"], "args": action["args"]},
                 },
+                "isSuccess": True,
+                "code": "SUCCESS",
+                "message": "Confirmation required",
             }
 
         # AI가 생성한 최종 답변을 추출 (마지막 메시지의 content)
@@ -139,13 +141,14 @@ async def chat(request: ChatRequest):
             ai_message = check_hallucination(ai_message, combined_context)
 
         return {
-            "success": True,
-            "message": "Chat completed successfully",
             "data": {
                 "response": ai_message,
                 "thread_id": request.thread_id,
                 "status": "completed",
             },
+            "isSuccess": True,
+            "code": "SUCCESS",
+            "message": "Chat completed successfully",
         }
 
     except Exception as e:
@@ -194,13 +197,14 @@ async def confirm(request: ConfirmRequest):
         ai_message = result["messages"][-1].content
         status = "submitted" if request.decision == "approve" else "cancelled"
         return {
-            "success": True,
-            "message": "Confirmation processed successfully",
             "data": {
                 "response": ai_message,
                 "thread_id": request.thread_id,
                 "status": status,
             },
+            "isSuccess": True,
+            "code": "SUCCESS",
+            "message": "Confirmation processed successfully",
         }
 
     except HTTPException:
