@@ -21,12 +21,17 @@ from agent.streaming import (
     is_final_answer_chunk,
     is_search_tool_result,
 )
-from models.chat import ChatRequest, ConfirmRequest
+from models.chat import (
+    ChatRequest,
+    ChatResponse,
+    ConfirmRequest,
+    ConfirmResponse,
+)
 
 router = APIRouter(tags=["Chat"])
 
 
-@router.post("/chat")
+@router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """
     고객 메시지를 미들웨어 파이프라인을 통해 처리하고 안전한 답변을 반환.
@@ -147,7 +152,7 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/chat/confirm")
+@router.post("/chat/confirm", response_model=ConfirmResponse)
 async def confirm(request: ConfirmRequest):
     """
     사용자 본인이 환불 신청을 확인(approve)하거나 취소(reject)하여 에이전트를 재개한다.
@@ -204,7 +209,26 @@ async def confirm(request: ConfirmRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/chat/stream")
+@router.post(
+    "/chat/stream",
+    response_class=EventSourceResponse,
+    responses={
+        200: {
+            "description": "SSE stream. 이벤트 목록: token | message | blocked | confirmation_required | done | error",
+            "content": {
+                "text/event-stream": {
+                    "schema": {
+                        "type": "string",
+                        "example": (
+                            "event: token\ndata: {\"content\": \"안녕하세요\"}\n\n"
+                            "event: done\ndata: {\"thread_id\": \"abc\", \"status\": \"completed\"}\n\n"
+                        ),
+                    }
+                }
+            },
+        }
+    },
+)
 async def chat_stream(request: ChatRequest):
     """고객 메시지를 SSE로 스트리밍 처리한다.
 
