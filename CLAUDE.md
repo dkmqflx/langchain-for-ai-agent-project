@@ -14,7 +14,7 @@ B2B SaaS customer support agent that answers questions from uploaded company doc
 - **Keyword search**: BM25 (Hybrid Search with RRF algorithm)
 - **Embeddings**: `OpenAIEmbeddings` + `CacheBackedEmbeddings`
 - **Backend**: FastAPI + Python
-- **Frontend**: Next.js 15 (App Router) + Tailwind CSS
+- **Frontend**: Next.js 16 (App Router) + Tailwind CSS
 - **Infra**: AWS EC2 (FastAPI) + RDS PostgreSQL (pgvector)
 - **Monitoring**: LangSmith + CloudWatch
 

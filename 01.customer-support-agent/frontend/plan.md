@@ -2,7 +2,7 @@
 
 ## Context
 
-`01.customer-support-agent/backend`(FastAPI)에 대한 프론트엔드를 Next.js 15(App Router) + Tailwind로 구축한다.
+`01.customer-support-agent/backend`(FastAPI)에 대한 프론트엔드를 Next.js 16(App Router) + Tailwind로 구축한다.
 스트리밍 채팅이 핵심이며, **AI SDK의 `useChat` + AI Elements 컴포넌트**를 풀스택으로 활용한다.
 
 ### 채택 방식: C안 (FastAPI가 AI SDK 프로토콜을 직접 emit)
@@ -61,9 +61,18 @@ FastAPI /chat/stream                ← Phase 1에서 출력 "형식만" 변환 
 
 ---
 
-## Phase 0 — 프로젝트 셋업 & 기반
+## Phase 0 — 프로젝트 셋업 & 기반 ✅ 완료
 
-**목표**: 빈 `frontend/`에 Next.js 15 + Tailwind + shadcn/ui + AI SDK + AI Elements를 설치하고, FastAPI를 가리키는 환경변수·폴더 구조를 만든다.
+**목표**: 빈 `frontend/`에 Next.js 16 + Tailwind + shadcn/ui + AI SDK + AI Elements를 설치하고, FastAPI를 가리키는 환경변수·폴더 구조를 만든다.
+
+> **설치된 실제 버전**: Next.js `16.2.7`, React `19.2`, Tailwind `v4`, `ai@6`, `@ai-sdk/react@3`. (Node 20.17 — Next 16은 20.19+ 권장이라 `EBADENGINE` 경고가 뜨지만 dev/실행은 정상.)
+>
+> **알려진 이슈 / 다음 단계 입력값** (검증으로 확인된 실제 상태):
+> - 🔴 **`next build` 현재 실패**: dev 서버는 뜨지만(타입에러 무시) **프로덕션 빌드는 깨진 상태**다. 원인은 AI Elements 컴포넌트들이 구 Base UI API(`openDelay`/`closeDelay`, `preventBaseUIHandler` 등)로 작성됐는데 설치된 `@base-ui/react@1.5.0`엔 해당 prop이 없는 **버전 드리프트**. 영향 파일: `inline-citation`, `attachments`, `prompt-input`, `context`, `schema-display`, `voice-selector` 등 — **우리가 쓸 `prompt-input` 포함**. → **Phase 2 착수 전 선결 과제**. 해결 후보: ① Base UI 호환 버전 핀, ② 해당 컴포넌트 수동 패치, ③ ai-elements 레지스트리 갱신 대기. (`typescript.ignoreBuildErrors`로 덮는 건 '공식 문서대로' 표준에 어긋나므로 지양.)
+> - ⏩ **[Phase 1 선행 입력]** AI SDK가 **v6**다. 백엔드가 emit할 형식은 "v6 `useChat`이 받기를 기대하는 Data Stream Protocol"이어야 하므로, **Phase 1 착수 전** 이 문서 상단 'Data Stream Protocol' 표와 `DefaultChatTransport`를 **v6 공식 문서로 재확인**한다(v5 기준 표기일 수 있음). 이건 Phase 2가 아니라 Phase 1의 입력값.
+> - 📄 `frontend/AGENTS.md` 지시: "이 Next는 네가 알던 Next가 아니다 — 코드 작성 전 `node_modules/next/dist/docs/`의 해당 가이드를 먼저 읽어라." Phase 1~2 구현 시 준수.
+>
+> **권장 다음 micro-step (Phase 1 전)**: AI Elements가 이 스택(Next16/React19/AI SDK v6)에서 *런타임에 실제로 렌더되는지* 15분 스파이크로 확인 — mock `useChat`으로 `Conversation`+`PromptInput`만 띄워본다. 백엔드를 통째로 갈아엎는 Phase 1 전에 UI 라이브러리 생존을 먼저 검증.
 
 ### 작업
 
@@ -77,9 +86,10 @@ FastAPI /chat/stream                ← Phase 1에서 출력 "형식만" 변환 
 5. **환경변수**: `.env.local`에 `NEXT_PUBLIC_API_URL=http://localhost:8000`.
 6. **공통 API 헬퍼**: `lib/api.ts` — `NEXT_PUBLIC_API_URL` 기반 fetch 래퍼(에러 처리, JSON 파싱). 백엔드 응답 봉투(`{ data, isSuccess, code, message }`)를 다루는 타입도 여기 정의.
 
-### 검증
-- `npm run dev` → 기본 페이지가 `localhost:3000`에 뜬다.
-- Tailwind 클래스가 적용되고, shadcn 컴포넌트 1개(예: Button) 임포트가 에러 없이 된다.
+### 검증 ✅
+- `npm run dev` → 기본 페이지가 뜬다(3000 사용 중이라 3001, HTTP 200 확인).
+- `.env.local` 로드 확인, `turbopack.root` 고정으로 lockfile 워크스페이스 경고 해소.
+- shadcn 초기화로 `components/ui/button.tsx`·`lib/utils.ts` 생성됨.
 
 ### 커밋
 `chore(frontend): scaffold next.js + tailwind + ai sdk + ai elements`
@@ -91,6 +101,8 @@ FastAPI /chat/stream                ← Phase 1에서 출력 "형식만" 변환 
 **목표**: FastAPI가 내보내는 **스트림 출력 형식**을 AI SDK가 이해하는 형식으로 바꾼다. **에이전트 로직·미들웨어·가드레일·HITL·할루시네이션 검사는 그대로 둔다.**
 
 > 이 Phase만 백엔드(`backend/routers/chat.py`, `backend/agent/streaming.py`)를 수정한다. 가장 novel하고 위험한 단계이므로 단독 Phase로 분리.
+>
+> ⏩ **선행 입력**: 착수 전 AI SDK **v6**의 Data Stream Protocol/`useChat` 수신 형식을 공식 문서로 확정할 것(Phase 0 메모 참조). 백엔드는 "v6가 받기를 기대하는 형식"만 emit하면 된다.
 
 ### 작업 (출력 형식 매핑)
 
@@ -125,6 +137,8 @@ FastAPI /chat/stream                ← Phase 1에서 출력 "형식만" 변환 
 ---
 
 ## Phase 2 — 채팅 UI 기본 스트리밍
+
+> 🔴 **선결 과제**: Phase 0에서 확인된 `next build` 실패(AI Elements ↔ `@base-ui/react@1.5.0` 타입 드리프트)를 먼저 해결할 것. 우리가 쓸 `prompt-input`이 영향 파일에 포함된다. (Phase 0 메모의 해결 후보 참조.)
 
 **목표**: `useChat`으로 `/chat/stream`에 연결하고, 일반 답변 토큰이 실시간으로 화면에 흐르게 한다.
 
@@ -255,7 +269,7 @@ FastAPI /chat/stream                ← Phase 1에서 출력 "형식만" 변환 
 
 ## 진행 체크리스트
 
-- [ ] Phase 0 — 셋업
+- [x] Phase 0 — 셋업
 - [ ] Phase 1 — 백엔드 프로토콜 변환 ⚠️
 - [ ] Phase 2 — 채팅 스트리밍 UI
 - [ ] Phase 3 — 차단 + 환불 확인 data part ⚠️
