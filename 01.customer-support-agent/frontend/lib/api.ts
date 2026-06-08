@@ -1,7 +1,7 @@
 /**
  * FastAPI 백엔드 호출용 공통 헬퍼.
  *
- * 스트리밍 채팅(/chat/stream)은 AI SDK의 useChat이 직접 다루므로 여기서 처리하지 않는다.
+ * 스트리밍 채팅(/chat/stream)은 lib/chat.ts가 fetch + ReadableStream으로 직접 SSE를 파싱한다.
  * 이 모듈은 JSON 응답을 주는 비스트리밍 엔드포인트
  * (/upload, /documents, /chat/confirm, /pending, /approve, /refunds)용이다.
  */

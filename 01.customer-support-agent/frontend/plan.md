@@ -1,40 +1,37 @@
-# Frontend Implementation Plan — Next.js + AI SDK + AI Elements
+# Frontend Implementation Plan — Next.js + 커스텀 SSE 클라이언트
 
 ## Context
 
 `01.customer-support-agent/backend`(FastAPI)에 대한 프론트엔드를 Next.js 16(App Router) + Tailwind로 구축한다.
-스트리밍 채팅이 핵심이며, **AI SDK의 `useChat` + AI Elements 컴포넌트**를 풀스택으로 활용한다.
+스트리밍 채팅이 핵심이며, **백엔드가 내보내는 커스텀 SSE를 프론트가 직접 `fetch` + `ReadableStream`으로 파싱**한다(AI SDK 미사용).
 
-### 채택 방식: C안 (FastAPI가 AI SDK 프로토콜을 직접 emit)
+### 방식: FastAPI 커스텀 SSE를 프론트가 직접 소비
 
-AI Elements(`elements.ai-sdk.dev`)는 독립 UI 라이브러리가 아니라 **AI SDK의 `useChat` 위에 얹힌 shadcn/ui 컴포넌트**다.
-따라서 `useChat`이 이해하는 스트림 형식으로 데이터가 와야 한다. 세 가지 연동 방식 중:
+- 백엔드는 **그대로** 둔다(`/chat/stream`이 이미 커스텀 SSE를 emit).
+- 프론트는 `fetch` + `ReadableStream`으로 SSE를 직접 파싱하는 커스텀 파서(`lib/chat.ts`)를 둔다. **AI SDK(`useChat`/`streamText`)는 쓰지 않는다.**
 
-| 방식 | 백엔드 | useChat | 비고 |
-|------|--------|---------|------|
-| A. 직접 SSE 소비 | 그대로 | ❌ | 커스텀 훅 직접 작성, AI SDK 미사용 |
-| B. Next.js 프록시 변환 | 그대로 | ✅ | Route Handler가 형식 변환 |
-| **C. FastAPI 직접 emit** ★채택 | **수정** | ✅ | 공식 권장, 프록시 불필요 |
-
-C를 택한 이유:
-- **공식 문서 표준**: AI SDK는 "다른 언어 백엔드는 Data Stream Protocol을 직접 emit하고 `useChat`을 그 엔드포인트로 가리키라"고 안내한다. Vercel 공식 FastAPI 템플릿도 존재. → 레포 `CLAUDE.md`의 "공식 문서만" 표준에 가장 부합.
-- 프록시/변환 레이어가 없어 구조가 단순하다.
+> **백엔드는 수정하지 않는다.** `backend/routers/chat.py`의 `/chat/stream`은 이미 커스텀 SSE를 emit하고
+> `backend/agent/streaming.py`의 판별 헬퍼도 그대로다. 이 plan은 **프론트엔드만** 다룬다.
 
 ### 전체 아키텍처
 
 ```
-Browser (Next.js + AI Elements)
-   │  useChat({ transport: DefaultChatTransport({ api: FASTAPI/chat/stream }) })
+Browser (Next.js + shadcn/ui, plain 말풍선)
+   │  lib/chat.ts: fetch POST /chat/stream → res.body.getReader() → SSE 블록 파싱 → onEvent 콜백
    ▼
-FastAPI /chat/stream                ← Phase 1에서 출력 "형식만" 변환 (로직 유지)
-   │  헤더: x-vercel-ai-ui-message-stream: v1
-   │  data: {"type":"text-delta","id":"0","delta":"..."}   ← 토큰
-   │  data: {"type":"data-blocked","data":{...}}            ← 욕설 차단
-   │  data: {"type":"data-confirmation","data":{...}}       ← 환불 본인확인
-   │  data: {"type":"finish"}  /  data: [DONE]
+FastAPI /chat/stream                ← 변경 없음 (이미 커스텀 SSE emit)
+   │  event: token                 {"content":"..."}                              ← 일반 답변 토큰(실시간)
+   │  event: message               {"response":"...","status":"completed"}        ← RAG 검사본(1회)
+   │  event: blocked               {"response":"...","thread_id":"..."}           ← 욕설 차단
+   │  event: confirmation_required {"thread_id":"...","tool":"...","args":{...}}   ← 환불 본인확인
+   │  event: done                  {"thread_id":"...","status":"completed"}
+   │  event: error                 {"detail":"..."}
    ▼
 기존 에이전트 파이프라인 (가드레일·HITL·할루시네이션·PII) — 그대로 유지
 ```
+
+**핵심 주의**: 일반 답변은 `token`이 여러 번 흐르고, **RAG(검색) 답변은 `token` 없이 `message` 1회**로 온다
+(할루시네이션 검사 후 완성본). 프론트 파서/UI는 두 경우를 모두 처리해야 한다.
 
 ### 화면 범위 (4개)
 
@@ -49,141 +46,116 @@ FastAPI /chat/stream                ← Phase 1에서 출력 "형식만" 변환 
 
 - **한 단계씩(step by step)** 진행한다. 각 Phase는 독립적으로 완성·검증·커밋 가능하도록 설계했다.
 - 각 Phase 끝에는 **검증 방법**과 **커밋**이 있다. 검증을 통과해야 다음 Phase로 넘어간다.
-- 모든 코드는 각 라이브러리 **공식 문서**에 따라 작성한다(`CLAUDE.md` 표준). 아래 명시한 type/필드/컴포넌트명은 작성 시 공식 문서로 한 번 더 검증한다.
+- 모든 코드는 각 라이브러리 **공식 문서**에 따라 작성한다(`CLAUDE.md` 표준).
 
 ### 공식 문서 레퍼런스
 
-- AI SDK UI (`useChat`, 스트림 프로토콜): https://ai-sdk.dev/docs/ai-sdk-ui
-- Data Stream Protocol: https://ai-sdk.dev/docs/ai-sdk-ui/stream-protocol
-- AI Elements: https://elements.ai-sdk.dev/
+- MDN — Fetch & Streams (`ReadableStream`, `getReader`, `TextDecoder`): https://developer.mozilla.org/en-US/docs/Web/API/Streams_API
+- MDN — Server-Sent Events 포맷: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events
 - Next.js App Router: https://nextjs.org/docs/app
 - shadcn/ui: https://ui.shadcn.com/docs
+- (참고) `frontend/AGENTS.md`: "이 Next는 네가 알던 Next가 아니다 — 코드 작성 전 `node_modules/next/dist/docs/`의 해당 가이드를 먼저 읽어라."
 
 ---
 
 ## Phase 0 — 프로젝트 셋업 & 기반 ✅ 완료
 
-**목표**: 빈 `frontend/`에 Next.js 16 + Tailwind + shadcn/ui + AI SDK + AI Elements를 설치하고, FastAPI를 가리키는 환경변수·폴더 구조를 만든다.
+**목표**: Next.js 16 + Tailwind + shadcn/ui 기반을 갖추고, FastAPI를 가리키는 환경변수·폴더 구조를 만든다.
 
-> **설치된 실제 버전**: Next.js `16.2.7`, React `19.2`, Tailwind `v4`, `ai@6`, `@ai-sdk/react@3`. (Node 20.17 — Next 16은 20.19+ 권장이라 `EBADENGINE` 경고가 뜨지만 dev/실행은 정상.)
->
-> **알려진 이슈 / 다음 단계 입력값** (검증으로 확인된 실제 상태):
-> - 🔴 **`next build` 현재 실패**: dev 서버는 뜨지만(타입에러 무시) **프로덕션 빌드는 깨진 상태**다. 원인은 AI Elements 컴포넌트들이 구 Base UI API(`openDelay`/`closeDelay`, `preventBaseUIHandler` 등)로 작성됐는데 설치된 `@base-ui/react@1.5.0`엔 해당 prop이 없는 **버전 드리프트**. 영향 파일: `inline-citation`, `attachments`, `prompt-input`, `context`, `schema-display`, `voice-selector` 등 — **우리가 쓸 `prompt-input` 포함**. → **Phase 2 착수 전 선결 과제**. 해결 후보: ① Base UI 호환 버전 핀, ② 해당 컴포넌트 수동 패치, ③ ai-elements 레지스트리 갱신 대기. (`typescript.ignoreBuildErrors`로 덮는 건 '공식 문서대로' 표준에 어긋나므로 지양.)
-> - ⏩ **[Phase 1 선행 입력]** AI SDK가 **v6**다. 백엔드가 emit할 형식은 "v6 `useChat`이 받기를 기대하는 Data Stream Protocol"이어야 하므로, **Phase 1 착수 전** 이 문서 상단 'Data Stream Protocol' 표와 `DefaultChatTransport`를 **v6 공식 문서로 재확인**한다(v5 기준 표기일 수 있음). 이건 Phase 2가 아니라 Phase 1의 입력값.
-> - 📄 `frontend/AGENTS.md` 지시: "이 Next는 네가 알던 Next가 아니다 — 코드 작성 전 `node_modules/next/dist/docs/`의 해당 가이드를 먼저 읽어라." Phase 1~2 구현 시 준수.
->
-> **권장 다음 micro-step (Phase 1 전)**: AI Elements가 이 스택(Next16/React19/AI SDK v6)에서 *런타임에 실제로 렌더되는지* 15분 스파이크로 확인 — mock `useChat`으로 `Conversation`+`PromptInput`만 띄워본다. 백엔드를 통째로 갈아엎는 Phase 1 전에 UI 라이브러리 생존을 먼저 검증.
+- **버전**: Next.js `16.2.7`, React `19.2`, Tailwind `v4`.
+- **포트 조합**: 프론트 dev `3100`(`next dev -p 3100`) → 백엔드 `8000`. (백엔드 CORS가 `localhost:3100` 허용.)
+- **유지 의존성**: `@base-ui/react`(shadcn `components/ui/*`의 엔진 — 제거 금지), `class-variance-authority`, `clsx`, `tailwind-merge`, `cmdk`, `embla-carousel-react`, `lucide-react`, `tw-animate-css`, `shadcn`.
+
+### 커밋
+`chore(frontend): drop ai sdk / ai elements, unblock production build`
+
+---
+
+## Phase 1 — 프론트엔드 SSE 클라이언트 `lib/chat.ts`
+
+**목표**: 백엔드 `/chat/stream`(이미 커스텀 SSE emit)을 호출하고, SSE 블록을 파싱해 이벤트 콜백으로 넘기는
+**순수 클라이언트 모듈**을 만든다. **UI는 아직 만들지 않는다** — 통신 계층만 단독으로 완성·검증한다.
+
+> 백엔드는 변경하지 않는다. 이 Phase의 산출물은 `frontend/lib/chat.ts` 하나다.
+> 가장 깨지기 쉬운 부분(SSE 파싱·CRLF 구분자)을 UI와 분리해 먼저 안정화한다.
 
 ### 작업
 
-1. **Next.js 생성** (현재 `frontend/`에서):
-   - `npx create-next-app@latest .` — App Router, TypeScript, Tailwind, ESLint 선택.
-2. **shadcn/ui 초기화**: `npx shadcn@latest init` (AI Elements가 shadcn 위에 설치되므로 선행 필수).
-3. **AI SDK 설치**: `npm i ai @ai-sdk/react`.
-4. **AI Elements 설치**: `npx ai-elements@latest`
-   - 또는 컴포넌트별: `npx shadcn@latest add https://elements.ai-sdk.dev/api/registry/all.json`
-   - 컴포넌트는 `@/components/ai-elements/`에 코드로 설치됨(직접 커스터마이즈 가능).
-5. **환경변수**: `.env.local`에 `NEXT_PUBLIC_API_URL=http://localhost:8000`.
-6. **공통 API 헬퍼**: `lib/api.ts` — `NEXT_PUBLIC_API_URL` 기반 fetch 래퍼(에러 처리, JSON 파싱). 백엔드 응답 봉투(`{ data, isSuccess, code, message }`)를 다루는 타입도 여기 정의.
-
-### 검증 ✅
-- `npm run dev` → 기본 페이지가 뜬다(3000 사용 중이라 3001, HTTP 200 확인).
-- `.env.local` 로드 확인, `turbopack.root` 고정으로 lockfile 워크스페이스 경고 해소.
-- shadcn 초기화로 `components/ui/button.tsx`·`lib/utils.ts` 생성됨.
-
-### 커밋
-`chore(frontend): scaffold next.js + tailwind + ai sdk + ai elements`
-
----
-
-## Phase 1 — 백엔드 `/chat/stream`을 AI SDK Data Stream Protocol로 변환 (C의 핵심) ⚠️
-
-**목표**: FastAPI가 내보내는 **스트림 출력 형식**을 AI SDK가 이해하는 형식으로 바꾼다. **에이전트 로직·미들웨어·가드레일·HITL·할루시네이션 검사는 그대로 둔다.**
-
-> 이 Phase만 백엔드(`backend/routers/chat.py`, `backend/agent/streaming.py`)를 수정한다. 가장 novel하고 위험한 단계이므로 단독 Phase로 분리.
->
-> ⏩ **선행 입력**: 착수 전 AI SDK **v6**의 Data Stream Protocol/`useChat` 수신 형식을 공식 문서로 확정할 것(Phase 0 메모 참조). 백엔드는 "v6가 받기를 기대하는 형식"만 emit하면 된다.
-
-### 작업 (출력 형식 매핑)
-
-기존 커스텀 SSE → AI SDK 파트 변환:
-
-| 기존 이벤트 | → AI SDK 파트 |
-|------------|---------------|
-| 응답 시작 | `{"type":"start"}` → `{"type":"text-start","id":"0"}` |
-| `event: token` `{content}` | `{"type":"text-delta","id":"0","delta":"..."}` |
-| 답변 끝 | `{"type":"text-end","id":"0"}` |
-| `event: blocked` | `{"type":"data-blocked","data":{"reason":"..."}}` (커스텀 data part) |
-| `event: confirmation_required` | `{"type":"data-confirmation","data":{"tool":"...","args":{...},"thread_id":"..."}}` |
-| `event: done` | `{"type":"finish"}` → `data: [DONE]` |
-| 예외 | `{"type":"error","errorText":"..."}` |
-
-- **응답 헤더**: `x-vercel-ai-ui-message-stream: v1` 추가.
-- **RAG 답변 버퍼링 처리 유지**: 현재 코드는 검색(RAG) 답변일 때 토큰을 버퍼링했다가 할루시네이션 검사 후 한 번에 보낸다. 프로토콜에서는 → 일반 답변은 `text-delta`를 실시간 emit, RAG 답변은 deltas를 보류했다가 **검사 완료본을 `text-start`→`text-delta`(전체)→`text-end`로 1회 emit**.
-- **알려진 한계 유지**(설계 문서에 이미 기재): 스트리밍 경로의 출력 PII 마스킹·할루시네이션 교정 보장은 비스트리밍 `POST /chat`에서만. 이 한계는 그대로 둔다(별도 개선 아님).
+1. **`lib/chat.ts`** 작성:
+   - `ChatEvent` 타입 — 백엔드 이벤트와 1:1: `token` | `message` | `blocked` | `confirmation_required` | `done` | `error`.
+   - `parseSseBlock(block)` — `event:` / `data:` 라인을 읽어 `{ type, ...JSON }`로 변환.
+   - `streamChat(body, onEvent)` — `fetch(POST /chat/stream)` → `res.body.getReader()`로 청크를 읽으며
+     **버퍼에 누적 → SSE 구분자로 분리 → 완성된 블록만 파싱**.
+   - `confirmChat(body)` — 환불 확인/취소용 비스트리밍 `POST /chat/confirm` 호출(Phase 3에서 사용).
+2. **⚠️ CRLF 구분자 함정**(backend/CLAUDE.md·메모리에 기록): `sse-starlette`는 이벤트 구분자를 **`\r\n\r\n`**으로
+   내보낸다. `buffer.split("\n\n")`만 쓰면 블록이 영영 안 나뉘어 **화면이 빈다.** 반드시
+   `buffer.split(/\r\n\r\n|\n\n/)`로 분리하고, 라인 파싱 시 `.trim()`으로 잔여 `\r`를 제거한다.
 
 ### 검증
-- `curl -N -H "Content-Type: application/json" -d '{"message":"안녕"}' http://localhost:8000/chat/stream` →
-  - 응답 헤더에 `x-vercel-ai-ui-message-stream: v1`.
-  - 본문이 `data: {"type":"text-delta",...}` 형식으로 흐르고 `data: [DONE]`로 끝남.
-- 욕설 입력 → `data-blocked` 파트가 나온다.
-- 환불 요청 입력 → `data-confirmation` 파트가 나온다.
-- 비스트리밍 `POST /chat`은 영향 없음(기존 테스트 통과).
-- CORS: `localhost:3000` Origin 허용 확인(`backend/main.py`에 CORS 이미 설정됨 — origin 목록만 점검).
+```bash
+# 백엔드 실행 중이어야 함 (OPENAI_API_KEY + DB 필요)
+cd backend && uv run uvicorn main:app --reload   # 별도 터미널
+```
+- Node 스크립트나 임시 페이지에서 `streamChat({message:"안녕", thread_id:"t1", user_id:"u1"}, console.log)`를 호출 →
+  콘솔에 `{type:"token", content:"..."}`들이 흐르고 `{type:"done", ...}`로 끝나는지 확인.
+- raw 바이트 확인이 필요하면: `curl -sN -d '{"message":"안녕","thread_id":"t1","user_id":"u1"}' -H "Content-Type: application/json" http://localhost:8000/chat/stream | xxd | grep 0d0a0d0a` (CRLF 구분자 존재 확인).
 
 ### 커밋
-`feat(backend): emit ai sdk data stream protocol on /chat/stream`
+`feat(frontend): add /chat/stream sse client (lib/chat.ts)`
 
 ---
 
-## Phase 2 — 채팅 UI 기본 스트리밍
+## Phase 2 — 채팅 UI 기본 스트리밍 (plain shadcn/ui)
 
-> 🔴 **선결 과제**: Phase 0에서 확인된 `next build` 실패(AI Elements ↔ `@base-ui/react@1.5.0` 타입 드리프트)를 먼저 해결할 것. 우리가 쓸 `prompt-input`이 영향 파일에 포함된다. (Phase 0 메모의 해결 후보 참조.)
-
-**목표**: `useChat`으로 `/chat/stream`에 연결하고, 일반 답변 토큰이 실시간으로 화면에 흐르게 한다.
+**목표**: `lib/chat.ts`를 써서 일반 답변 토큰이 실시간으로 화면에 흐르게 한다. AI Elements 없이
+shadcn/ui + Tailwind로 말풍선/입력창을 직접 구성한다.
 
 ### 작업
 1. **`app/page.tsx`** (채팅 화면) — 클라이언트 컴포넌트.
-2. `useChat`(`@ai-sdk/react`) + `DefaultChatTransport({ api: ${NEXT_PUBLIC_API_URL}/chat/stream })`.
-3. AI Elements 조합:
-   - `Conversation` — 메시지 스크롤 영역
-   - `Message` / `MessageContent` / `Response` — 말풍선 + 마크다운 렌더
-   - `PromptInput` — 입력창 + 전송
-   - `Loader` — 스트리밍 대기 표시
-4. **요청 바디 매핑**: 백엔드는 `{ message, thread_id, user_id }`를 받는다. `useChat`의 전송 바디를 백엔드 스키마에 맞게 구성(transport의 body/prepare 옵션 활용). `thread_id`(대화 단위), `user_id`(임시 상수/입력값) 관리.
+2. **상태 관리(커스텀 훅 권장 `lib/useChatStream.ts` 또는 page 내부)**:
+   - `messages: { role, content }[]`, `streaming: boolean`, `input: string`.
+   - 전송 시 `streamChat({message, thread_id, user_id}, onEvent)` 호출.
+   - `onEvent` 처리:
+     - `token` → 진행 중인 assistant 메시지에 `content` **누적**(append).
+     - `message` → assistant 메시지를 `response`로 **교체/확정**(RAG 검사본은 토큰 없이 한 번에 옴).
+     - `done` → 스트리밍 종료.
+     - `blocked` / `confirmation_required` → Phase 3에서 처리(지금은 임시로 무시 또는 텍스트 표시).
+     - `error` → 에러 메시지 표시.
+3. **UI**: shadcn `Button`/`Input` + 직접 만든 말풍선(`role`에 따라 정렬/색). 스트리밍 중 표시(점멸 커서/spinner).
+   - 마크다운 렌더가 필요하면 `react-markdown` 등 **경량 라이브러리만** 추가(선택).
+4. **`thread_id`(대화 단위), `user_id`(임시 상수/입력값) 관리.**
 
 ### 검증
-- 일반 질문 입력 → 토큰이 한 글자씩 실시간으로 누적 렌더된다.
-- 새로고침 후 동일 `thread_id`로 대화 맥락이 이어지는지(단기 기억) 확인.
+- 일반 질문 → 토큰이 실시간 누적 렌더된다.
+- 문서 기반 질문(RAG) → `message`로 완성본이 한 번에 뜬다(토큰 흐름 없이).
+- 같은 `thread_id` 유지 시 대화 맥락이 이어진다(단기 기억).
 
 ### 커밋
-`feat(frontend): streaming chat ui with usechat + ai elements`
+`feat(frontend): streaming chat ui consuming /chat/stream sse`
 
 ---
 
-## Phase 3 — 커스텀 data part 처리 (욕설 차단 + 환불 본인확인) ⚠️
+## Phase 3 — 차단 + 환불 본인확인 이벤트 처리 ⚠️
 
-**목표**: Phase 1에서 만든 `data-blocked` / `data-confirmation` 파트를 UI에서 처리한다. 이 프로젝트 고유의 도메인 흐름이라 가장 까다로운 단계.
+**목표**: `blocked` / `confirmation_required` 이벤트를 UI에서 처리한다. 이 프로젝트 고유 도메인 흐름이라 가장 까다롭다.
 
 ### 작업
-1. **`data-blocked`**: `useChat`의 data parts(`message.parts` 중 `data-blocked`)를 감지 → 차단 안내 메시지를 말풍선/배너로 표시.
-2. **`data-confirmation`** (환불 본인확인):
-   - AI Elements **`Confirmation`** 컴포넌트로 "환불 신청을 진행할까요?"(tool/args 표시) 렌더.
-   - **승인/취소 → `POST /chat/confirm`** 호출(`{ thread_id, decision: "approve"|"reject", user_id }`). 이건 `useChat` 스트림이 아니라 별도 fetch.
-   - 응답(`status: "submitted"|"cancelled"`)을 채팅에 후속 메시지로 반영.
-3. **상태 관리**: `data-confirmation`에서 받은 `thread_id`를 confirm 호출에 그대로 사용. confirm 이후 다시 채팅 흐름 복귀.
+1. **`blocked`**: `{response}`(차단 안내)를 말풍선/배너로 표시. 모델 호출 없이 단락된 흐름.
+2. **`confirmation_required`** (환불 본인확인):
+   - `{tool, args, thread_id}`로 "환불 신청을 진행할까요?"(주문/금액/사유 표시) 카드 렌더 — shadcn `Card`/`Button`.
+   - **승인/취소 → `confirmChat({ thread_id, decision: "approve"|"reject", user_id })`** 호출(`POST /chat/confirm`, 별도 fetch).
+   - 응답(`status: "submitted"|"cancelled"` + `response`)을 채팅 후속 메시지로 반영.
+3. **상태 관리**: `confirmation_required`에서 받은 `thread_id`를 confirm 호출에 그대로 사용. confirm 이후 채팅 흐름 복귀.
 
-> 참고: `args.user_id`를 클라이언트가 다시 보내는 알려진 한계는 백엔드와 동일하게 유지(학습용).
+> 참고: `user_id`를 클라이언트가 다시 보내는 알려진 한계는 백엔드와 동일하게 유지(학습용).
 
 ### 검증
 - 욕설 입력 → 차단 메시지 표시(모델 호출 없이 단락).
-- "환불해줘 ORD-123" 류 입력 → `Confirmation` UI 표시 →
-  - 승인 → "신청 접수(submitted)" 반영
-  - 취소 → "취소(cancelled)" 반영
-- 승인 시 백엔드 `GET /pending`에 신청이 쌓이는지 교차 확인(Phase 5와 연결).
+- "환불해줘 ORD-123" 류 → 확인 카드 표시 → 승인="submitted" / 취소="cancelled" 반영.
+- 승인 시 `GET /pending`에 신청이 쌓이는지 교차 확인(Phase 4와 연결).
 
 ### 커밋
-`feat(frontend): handle blocked + refund confirmation data parts`
+`feat(frontend): handle blocked + refund confirmation sse events`
 
 ---
 
@@ -195,7 +167,7 @@ FastAPI /chat/stream                ← Phase 1에서 출력 "형식만" 변환 
 1. **`app/admin/documents/page.tsx`**.
 2. 파일 선택 + 업로드 폼 → `POST /upload` (multipart/form-data).
 3. `GET /documents` → 업로드된 문서 목록 테이블.
-4. 업로드 진행/성공/실패 상태 표시(shadcn `Toast`/`Button` 활용).
+4. 업로드 진행/성공/실패 상태 표시(shadcn `Toast`/`Button`).
 
 ### 검증
 - PDF 업로드 → 성공 응답 → 목록에 나타남.
@@ -263,16 +235,16 @@ FastAPI /chat/stream                ← Phase 1에서 출력 "형식만" 변환 
 ## 학습 가이드 관례 (참고)
 
 이 레포는 각 Phase 완료 후 `study/NN_phaseN_learning_guide.md`(한국어 초심자용 해설)를 작성하는 관례가 있다.
-프론트엔드도 동일하게 Phase별 학습 가이드를 남길지는 진행하며 결정한다.
+프론트엔드도 동일하게 `frontend/study/`에 Phase별 학습 가이드를 남긴다.
 
 ---
 
 ## 진행 체크리스트
 
-- [x] Phase 0 — 셋업
-- [ ] Phase 1 — 백엔드 프로토콜 변환 ⚠️
-- [ ] Phase 2 — 채팅 스트리밍 UI
-- [ ] Phase 3 — 차단 + 환불 확인 data part ⚠️
+- [x] Phase 0 — 셋업·정리 완료 (AI SDK/AI Elements 제거, 포트 정리, 빌드 성공)
+- [ ] Phase 1 — SSE 클라이언트 `lib/chat.ts`
+- [ ] Phase 2 — 채팅 스트리밍 UI (plain)
+- [ ] Phase 3 — 차단 + 환불 확인 이벤트 ⚠️
 - [ ] Phase 4 — 문서 업로드
 - [ ] Phase 5 — 환불 승인 큐
 - [ ] Phase 6 — 내 환불 조회
