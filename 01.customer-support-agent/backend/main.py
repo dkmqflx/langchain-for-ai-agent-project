@@ -70,12 +70,11 @@ app = FastAPI(
 )
 
 # CORS 미들웨어 설정
-# 프론트엔드(localhost:3000, Vercel)에서 API 호출 허용
+# 프론트엔드(localhost:3100, Vercel)에서 API 호출 허용
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",   # Next.js 로컬 개발 서버
-        "http://localhost:3001",   # Next.js 로컬 개발 서버 (3000 점유 시 대체 포트)
+        "http://localhost:3100",   # Next.js 로컬 개발 서버 (고정 포트)
         "https://*.vercel.app",    # Vercel 배포 프론트엔드
     ],
     allow_credentials=True,
