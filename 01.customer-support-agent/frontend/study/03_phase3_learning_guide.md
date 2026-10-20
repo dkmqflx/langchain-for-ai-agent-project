@@ -1,131 +1,111 @@
-# Phase 3 학습 가이드 — 커스텀 data part 처리 (욕설 차단 + 환불 본인확인)
+# Phase 3 학습 가이드 — 차단 + 환불 본인확인 이벤트 처리 ⚠️
 
-**목표**: Phase 1에서 백엔드가 내보내는 `data-blocked` / `data-confirmation` 파트를 프론트 UI에서 처리한다.
-이 프로젝트 **고유 도메인 흐름**이라 가장 까다로운 단계.
-
-> ⚠️ 전제: Phase 1(백엔드가 두 파트를 emit)과 Phase 2(useChat 연결)가 끝나 있어야 합니다.
+> **목표**: Phase 2의 채팅 UI에서 아직 무시했던 두 이벤트 —
+> `blocked`(욕설 차단)·`confirmation_required`(환불 본인확인)을 처리한다.
+> 이 프로젝트 **고유 도메인 흐름**이라 가장 까다로운 단계다.
+>
+> 손대는 파일: `app/page.tsx`(이벤트 분기 확장) + `lib/chat.ts`의 `confirmChat`(이미 있음) 사용.
 
 ---
 
 ## 학습 흐름도
 
 ```
-사용자 입력
-   ├── 욕설        → 백엔드가 모델 호출 없이 단락 → data-blocked 파트
-   │                  → 프론트: 차단 안내 배너/말풍선 표시 (끝)
-   │
-   └── "환불해줘"  → 백엔드가 본인확인 필요 판단 → data-confirmation 파트
-                      → 프론트: <Confirmation> UI 표시 (tool/args)
-                          ├── 승인 → POST /chat/confirm {decision:"approve"} → "접수(submitted)"
-                          └── 취소 → POST /chat/confirm {decision:"reject"}  → "취소(cancelled)"
+욕설 입력 ─────────────→ event: blocked        → 차단 안내 말풍선/배너 표시 (끝)
+
+"환불해줘 ORD-123" ───→ event: confirmation_required {tool, args, thread_id}
+                         ↓ 확인 카드 렌더 (주문/금액/사유 + 승인/취소 버튼)
+                         ↓ 사용자가 승인/취소
+                       confirmChat({thread_id, decision, user_id})  →  POST /chat/confirm
+                         ↓ 응답 {status:"submitted"|"cancelled", response}
+                       채팅 후속 메시지로 반영 (끝)
 ```
 
-핵심 구분: **`data-blocked`은 표시만, `data-confirmation`은 표시 + 별도 fetch(/chat/confirm)로 후속 동작.**
+핵심 한 줄: **"차단은 보여주기만, 환불 확인은 별도 fetch로 흐름을 재개."**
 
 ---
 
-## Step 1: data 파트를 messages에서 꺼내기 (10분)
+## Step 1: `blocked` 처리 (5분)
 
-v6에서 커스텀 data 파트는 `message.parts`에 `type: "data-<이름>"` 형태로 섞여 들어옵니다(Phase 1 매핑 참조).
+욕설 입력 시 백엔드 가드레일이 모델 호출 없이 단락하고 `event: blocked {response}`를 보냅니다.
 
 ```ts
-for (const part of message.parts) {
-  if (part.type === "text") { /* 일반 답변 */ }
-  else if (part.type === "data-blocked") {
-    // part.data === { reason: "..." }
-  }
-  else if (part.type === "data-confirmation") {
-    // part.data === { tool, args, thread_id }
-  }
+case "blocked":
+  next[last] = { role: "assistant", content: evt.response };  // 차단 안내 그대로 표시
+  break;
+```
+- 모델이 안 돌았으므로 `token`/`message`는 오지 않습니다. `blocked` → 곧이어 스트림 종료.
+- UI 강조가 필요하면 배너/경고색 말풍선으로 구분(선택).
+
+### 학습 질문
+- [ ] 차단 시 왜 `token`이 한 개도 안 오나? (힌트: before_agent 가드레일이 모델 전에 단락)
+
+---
+
+## Step 2: `confirmation_required` → 확인 카드 (10분)
+
+환불 신청(`submit_refund_request`)은 HITL로 **일시정지**되고, 백엔드가
+`event: confirmation_required {thread_id, tool, args}`를 보냅니다. `args`에는 `order_id`, `amount`, `reason` 등이 들어있습니다.
+
+```ts
+case "confirmation_required":
+  setPending({ threadId: evt.thread_id, tool: evt.tool, args: evt.args });
+  break;
+```
+- 이걸 받아 **shadcn `Card`**로 "환불 신청을 진행할까요?"를 그리고, `args`(주문/금액/사유)를 표시,
+  **승인/취소 버튼**을 둡니다.
+- 이때 스트림은 이미 끝난 상태입니다(일시정지). 재개는 **별도 fetch**(`/chat/confirm`)로 합니다.
+
+---
+
+## Step 3: 승인/취소 → `confirmChat` (재개) (15분)
+
+```ts
+async function decide(decision: "approve" | "reject") {
+  if (!pending) return;
+  const { response, status } = await confirmChat({
+    thread_id: pending.threadId,   // confirmation_required에서 받은 값을 그대로
+    decision,
+    user_id: userId,
+  });
+  setPending(null);
+  setMessages((m) => [...m, { role: "assistant", content: response }]);  // 후속 메시지 반영
+  // status: "submitted"(접수) | "cancelled"(취소)
 }
 ```
-- 데이터 형태는 `{ type, id?, data, transient? }`. 우리가 쓰는 건 `data` 안의 페이로드.
-- `data`의 실제 키(`reason`, `tool`, `args`, `thread_id`)는 **Phase 1에서 백엔드가 넣은 그대로**입니다 — 양쪽을 같은 표로 맞추세요.
+
+### ⚠️ `thread_id`가 흐름의 연결고리
+- `confirmation_required`에서 받은 `thread_id`를 **그대로** `confirmChat`에 넘겨야
+  백엔드 checkpointer가 "어느 대화에서 멈췄는지" 찾아 재개합니다. 새로 만들면 안 됩니다.
+
+> 참고: `user_id`를 클라이언트가 다시 보내는 알려진 한계는 백엔드와 동일하게 유지(학습용).
 
 ### 학습 질문
-- [ ] 표준 `text` 파트와 커스텀 `data-*` 파트를 어떻게 구분하나?
-- [ ] `transient` 파트는 어떤 의미인가? (히스토리에 남기지 않는 일회성 신호)
-
----
-
-## Step 2: `data-blocked` — 차단 안내 표시 (5분)
-
-가장 단순. 모델 호출이 없었으므로 답변 텍스트 대신 안내만 보여줍니다.
-
-- `part.data.reason`을 말풍선 또는 경고 배너로 렌더.
-- shadcn `Alert`(`components/ui/alert.tsx`, 이미 설치됨) 활용 가능.
-- 후속 동작 없음 — 사용자가 다시 입력하면 끝.
-
-### 학습 질문
-- [ ] 차단 메시지를 "AI 답변 말풍선"처럼 보이게 할까, "시스템 경고"처럼 보이게 할까? (UX 결정)
-
----
-
-## Step 3: `data-confirmation` — 환불 본인확인 (핵심) (15분)
-
-### 3-1. Confirmation UI 렌더 (검증된 export 이름)
-`components/ai-elements/confirmation.tsx`가 실제로 export하는 것들:
-```
-Confirmation, ConfirmationRequest, ConfirmationTitle,
-ConfirmationActions, ConfirmationAction,
-ConfirmationAccepted, ConfirmationRejected
-```
-- `data-confirmation`을 감지하면 "환불 신청을 진행할까요?"를 `tool`/`args`와 함께 렌더.
-- 정확한 props/합성 방식은 `confirmation.tsx`를 직접 열어 확인(상상 금지).
-
-### 3-2. 승인/취소 → `POST /chat/confirm` (별도 fetch)
-> ⚠️ **이건 `useChat` 스트림이 아니라 별도 HTTP 요청**입니다. Phase 0에서 만든 `lib/api.ts`의 `apiFetch` 사용.
-
-```ts
-import { apiFetch } from "@/lib/api";
-
-await apiFetch("/chat/confirm", {
-  method: "POST",
-  body: JSON.stringify({
-    thread_id,                       // data-confirmation에서 받은 값 그대로
-    decision: "approve" /* | "reject" */,
-    user_id,                         // 채팅에서 쓰던 값
-  }),
-});
-// 응답 status: "submitted" | "cancelled" → 채팅에 후속 메시지로 반영
-```
-- `apiFetch`는 봉투(`{data,isSuccess,code,message}`)를 벗겨 `data`만 돌려줍니다(실패 시 `ApiError`).
-
-### 3-3. 상태 관리
-- `data-confirmation`에서 받은 `thread_id`를 **그대로** confirm 호출에 사용 → 백엔드가 멈춰둔 LangGraph 상태를 재개.
-- confirm 응답을 받으면 결과 메시지를 채팅에 추가(`setMessages`)하고 다시 일반 채팅 흐름으로 복귀.
-
-> 참고(알려진 한계, 학습용 유지): `args.user_id`를 클라이언트가 다시 보내는 구조는 백엔드와 동일하게 둡니다.
-
-### 학습 질문
-- [ ] 승인이 왜 스트림이 아니라 별도 fetch인가? (HITL 재개는 새 요청이라서)
-- [ ] `thread_id`를 잘못 보내면? (다른 대화의 상태를 재개하거나 실패)
+- [ ] confirm 호출에 왜 **같은** `thread_id`를 써야 하나? (힌트: 멈춘 상태 조회 키)
+- [ ] confirm은 왜 스트림이 아니라 일반 fetch인가? (힌트: 단발성 결정 전송)
 
 ---
 
 ## 검증
 
 - [ ] 욕설 입력 → 차단 메시지 표시(모델 호출 없이 단락).
-- [ ] "환불해줘 ORD-123" 류 입력 → `Confirmation` UI 표시 →
-  - [ ] 승인 → "신청 접수(submitted)" 반영
-  - [ ] 취소 → "취소(cancelled)" 반영
+- [ ] "환불해줘 ORD-123" 류 → 확인 카드(주문/금액/사유) 표시.
+  - [ ] 승인 → "접수(submitted)" 후속 메시지.
+  - [ ] 취소 → "취소(cancelled)" 후속 메시지.
 - [ ] 승인 시 백엔드 `GET /pending`에 신청이 쌓이는지 교차 확인(Phase 5와 연결).
 
----
-
-## 검증 체크리스트 (개념)
-- [ ] `message.parts`에서 `data-*` 파트를 꺼내는 법을 안다.
-- [ ] `data-blocked`(표시만)와 `data-confirmation`(표시+fetch)의 차이를 안다.
-- [ ] confirm이 `useChat`이 아니라 `apiFetch`(별도 HTTP)인 이유를 안다.
-- [ ] `thread_id`가 HITL 상태 재개의 키라는 걸 안다.
+## 검증 체크리스트 (개념 이해)
+- [ ] `blocked`는 "표시만", `confirmation_required`는 "별도 fetch로 재개"임을 안다.
+- [ ] `thread_id`가 일시정지된 흐름을 재개하는 키임을 안다.
+- [ ] 승인/취소 후 채팅 흐름으로 복귀하는 상태 전환을 설명할 수 있다.
 
 ---
 
 ## 커밋
+
 ```
-feat(frontend): handle blocked + refund confirmation data parts
+feat(frontend): handle blocked + refund confirmation sse events
 ```
 
 ## 다음 단계
-- **Phase 4**: 관리자 문서 업로드(스트리밍 없는 단순 폼).
-- **Phase 5**: 여기서 승인한 환불이 쌓이는 관리자 승인 큐.
+- **Phase 4**: 관리자 문서 업로드 화면(`POST /upload`, `GET /documents`).

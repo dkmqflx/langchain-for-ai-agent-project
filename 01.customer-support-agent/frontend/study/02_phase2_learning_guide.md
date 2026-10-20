@@ -1,192 +1,136 @@
-# Phase 2 학습 가이드 — 채팅 UI 기본 스트리밍 (`useChat` + AI Elements)
+# Phase 2 학습 가이드 — 채팅 UI 기본 스트리밍 (plain shadcn/ui)
 
-**목표**: `useChat`으로 Phase 1의 `/chat/stream`에 연결하고, 일반 답변 토큰이 화면에 실시간으로 흐르게 한다.
+> **목표**: Phase 1의 `lib/chat.ts`를 써서 일반 답변 토큰이 **실시간으로** 화면에 흐르게 한다.
+> AI SDK/AI Elements 없이 **shadcn/ui + Tailwind로 말풍선·입력창을 직접** 만든다.
+>
+> 손대는 파일: `app/page.tsx` (+ 선택적으로 `lib/useChatStream.ts` 커스텀 훅).
 
 ---
 
-## 🔴 선결 과제 (Phase 2 착수 전 반드시 해결)
+## 왜 `useChat`을 안 쓰나 (1분)
 
-plan.md Phase 0 메모에 기록된 **`next build` 실패**를 먼저 고쳐야 합니다.
-
-- **증상**: `npm run dev`는 뜨지만(타입에러 무시) `npm run build`(프로덕션 빌드)가 깨짐.
-- **원인**: AI Elements 컴포넌트가 구 Base UI API(`openDelay`/`closeDelay`, `preventBaseUIHandler` 등)로 작성됐는데,
-  설치된 `@base-ui/react@1.5.0`에는 그 prop이 없는 **버전 드리프트**.
-- **영향 파일**: `inline-citation`, `attachments`, `prompt-input`, `context`, `schema-display`, `voice-selector` 등 —
-  **우리가 쓸 `prompt-input` 포함**.
-- **해결 후보**: ① Base UI 호환 버전 핀, ② 해당 컴포넌트 수동 패치, ③ ai-elements 레지스트리 갱신 대기.
-- **금지**: `typescript.ignoreBuildErrors`로 덮기. 레포의 "공식 문서대로" 표준에 어긋남.
-
-> 검증: 먼저 `npm run build`를 돌려 깨지는 파일을 확인하고, 우리가 실제로 import하는 컴포넌트(`prompt-input` 등)만
-> 우선 고쳐도 Phase 2 진행에는 충분합니다. 전부 한 번에 고칠 필요는 없습니다.
+`useChat`은 AI SDK의 "UI Message Stream" 형식만 받습니다. 우리 백엔드는 **커스텀 SSE**(`event: token` 등)를
+내보내므로, 둘을 맞추려면 백엔드를 AI SDK 포맷으로 바꾸거나(C안) Node 변환 레이어를 두어야(B안) 합니다.
+A안은 그 대신 **Phase 1의 `streamChat`**가 이미 이벤트를 콜백으로 주므로, 우리는 그 콜백으로
+**그냥 React state를 갱신**하면 됩니다. 추가 라이브러리가 필요 없습니다.
 
 ---
 
 ## 학습 흐름도
 
 ```
-app/page.tsx (클라이언트 컴포넌트, "use client")
-     │
-     │  const { messages, sendMessage, status } = useChat({ transport })
-     ▼
-DefaultChatTransport({ api: `${NEXT_PUBLIC_API_URL}/chat/stream`,
-                       prepareSendMessagesRequest: 바디를 백엔드 스키마로 변환 })
-     │  POST /chat/stream  ← Phase 1에서 만든 v6 스트림
-     ▼
-messages 배열이 토큰마다 갱신 → AI Elements 컴포넌트가 렌더
-     ▼
-<Conversation> → <Message> → <MessageContent> → <MessageResponse>(마크다운)
-<PromptInput>  → 입력/전송
+입력창 전송
+   ↓  streamChat({message, thread_id, user_id}, onEvent)
+onEvent(evt) {
+   token   → 진행 중 assistant 메시지에 content 누적(append)   ← 실시간 타이핑
+   message → assistant 메시지를 response로 교체/확정(RAG 검사본, 1회)
+   done    → streaming = false
+   error   → 에러 메시지 표시
+}
+   ↓  setMessages(...)
+React 리렌더 → 말풍선 갱신
 ```
+
+핵심 한 줄: **"이벤트가 올 때마다 state를 바꾸면, React가 알아서 다시 그린다."**
 
 ---
 
-## Step 1: `useChat`의 v6 반환값 (구버전과 다름!) (10분)
-
-> ⚠️ **훈련 데이터의 `useChat`과 다릅니다.** v6에는 `input`/`handleInputChange`/`handleSubmit`이 없습니다.
-> 아래는 설치된 `@ai-sdk/react@3.0.199`의 `UseChatHelpers` 타입에서 직접 확인한 반환값입니다.
+## Step 1: 상태 설계 (10분)
 
 ```ts
-const {
-  messages,      // UIMessage[] — 화면에 그릴 대화 배열
-  sendMessage,   // 메시지 전송 함수 (구버전 handleSubmit 대체)
-  status,        // "submitted" | "streaming" | "ready" | "error" 등 — 로딩 표시에 사용
-  error,         // Error | undefined
-  stop,          // 스트리밍 중단
-  regenerate,    // 마지막 답변 재생성
-  setMessages,   // 메시지 배열 직접 수정
-  addToolResult, // (Phase 3 참고) 도구 결과 주입
-} = useChat({ transport });
+type ChatMessage = { role: "user" | "assistant"; content: string };
+
+const [messages, setMessages] = useState<ChatMessage[]>([]);
+const [input, setInput] = useState("");
+const [streaming, setStreaming] = useState(false);
+// thread_id: 대화 단위(같으면 맥락 유지). user_id: 임시 상수 또는 입력값.
+const threadId = useRef(crypto.randomUUID()).current;
+const userId = "u1";
 ```
 
-핵심: **입력창의 텍스트 state는 우리가 직접 관리**하고(`useState`), 전송할 때 `sendMessage`를 호출합니다.
-
 ### 학습 질문
-- [ ] `messages`는 누가 갱신하나? (힌트: 스트림 파트가 올 때마다 useChat 내부가)
-- [ ] `status`의 값으로 무엇을 표현할 수 있나? (로딩 스피너/전송 버튼 비활성화)
+- [ ] `thread_id`를 매 전송마다 새로 만들면 무슨 일이 생기나? (힌트: 단기 기억이 끊김)
+- [ ] 왜 `streaming` 플래그가 필요한가? (힌트: 전송 버튼 비활성화/로딩 표시)
 
 ---
 
-## Step 2: 요청 바디를 백엔드 스키마에 맞추기 (가장 까다로운 부분) (10분)
-
-문제: `useChat`은 기본적으로 `{ messages: [...] }`를 보냅니다.
-하지만 우리 백엔드는 `{ message, thread_id, user_id }`를 받습니다. → **변환이 필요.**
-
-해결: `DefaultChatTransport`의 `prepareSendMessagesRequest` 옵션(설치된 `ai@6.0.197`에서 확인된 정확한 이름).
+## Step 2: 전송 핸들러 + `onEvent` 분기 (가장 중요) (15분)
 
 ```ts
-import { DefaultChatTransport } from "ai";
+async function handleSend() {
+  const text = input.trim();
+  if (!text || streaming) return;
+  setInput("");
+  setStreaming(true);
 
-const transport = new DefaultChatTransport({
-  api: `${process.env.NEXT_PUBLIC_API_URL}/chat/stream`,
-  prepareSendMessagesRequest: ({ messages, body }) => ({
-    body: {
-      message: messages[messages.length - 1]?.parts /* 마지막 사용자 입력 텍스트 추출 */,
-      thread_id: body?.thread_id,   // 대화 단위 식별자
-      user_id: body?.user_id,       // 임시 상수/입력값
-    },
-  }),
-});
-```
+  // 1) 내 메시지 + 빈 assistant 자리(여기에 토큰을 누적)
+  setMessages((m) => [...m, { role: "user", content: text }, { role: "assistant", content: "" }]);
 
-> 위 코드는 **형태 예시**입니다. `prepareSendMessagesRequest`의 정확한 인자/반환 형태는
-> 공식 문서(https://ai-sdk.dev/docs/ai-sdk-ui)와 `node_modules/ai/dist/index.d.ts`의
-> `PrepareSendMessagesRequest` 타입으로 한 번 더 확인하세요. (텍스트 추출은 `parts`에서 `type:"text"`를 찾는 방식)
-
-### thread_id / user_id 관리
-- `thread_id`: 대화 한 세션을 묶는 ID. 새 대화 시작 시 생성(`nanoid` 등), 이후 같은 값 유지 → 단기 기억 연결.
-- `user_id`: 지금은 임시 상수 또는 입력값. (Phase 3·6에서 confirm/조회에 재사용)
-
-### 학습 질문
-- [ ] 왜 `messages` 전체가 아니라 마지막 메시지의 텍스트만 보내나? (백엔드 스키마가 `message` 단일 필드라서)
-- [ ] `thread_id`를 새로고침 후에도 유지하려면 어디에 저장해야 하나? (localStorage/URL 등)
-
----
-
-## Step 3: AI Elements 컴포넌트 조합 (검증된 export 이름) (10분)
-
-> ⚠️ **plan.md의 컴포넌트 이름 일부가 실제 설치본과 다릅니다.** (advisor 지적 사항)
-> 아래는 `components/ai-elements/*.tsx`에서 **실제로 export하는** 이름입니다.
-
-| plan.md 표기 | 실제 설치된 export | 파일 |
-|---|---|---|
-| `Conversation` | `Conversation`, `ConversationContent`, `ConversationEmptyState`, `ConversationScrollButton` | `conversation.tsx` |
-| `Message`/`MessageContent` | `Message`, `MessageContent` | `message.tsx` |
-| **`Response`** ❌ | ✅ **`MessageResponse`** | `message.tsx` |
-| `PromptInput` | `PromptInput`, `PromptInputTextarea`, `PromptInputSubmit`, `PromptInputBody`, `PromptInputTools` 등 | `prompt-input.tsx` |
-| **`Loader`** ❌ | ✅ **`Shimmer`** (또는 `status`로 직접 표시) | `shimmer.tsx` |
-
-**규칙**: AI Elements는 `@/components/ai-elements/`에 **코드로 설치**되어 직접 커스터마이즈 가능합니다.
-정확한 props는 항상 해당 `.tsx` 파일을 직접 열어 확인하세요(상상 금지 — 이게 plan/CLAUDE.md의 "공식 문서대로" 표준).
-
-### 대략적인 골격
-```tsx
-"use client";
-import { useChat } from "@ai-sdk/react";
-import { DefaultChatTransport } from "ai";
-import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
-import { Message, MessageContent, MessageResponse } from "@/components/ai-elements/message";
-import { PromptInput, PromptInputTextarea, PromptInputSubmit } from "@/components/ai-elements/prompt-input";
-
-export default function ChatPage() {
-  const { messages, sendMessage, status } = useChat({ transport });
-  return (
-    <Conversation>
-      <ConversationContent>
-        {messages.map((m) => (
-          <Message key={m.id} from={m.role}>
-            <MessageContent>
-              {/* m.parts 중 text 파트를 MessageResponse로 마크다운 렌더 */}
-            </MessageContent>
-          </Message>
-        ))}
-      </ConversationContent>
-      <PromptInput onSubmit={/* sendMessage 호출 */}>
-        <PromptInputTextarea />
-        <PromptInputSubmit status={status} />
-      </PromptInput>
-    </Conversation>
-  );
+  await streamChat({ message: text, thread_id: threadId, user_id: userId }, (evt) => {
+    setMessages((m) => {
+      const next = [...m];
+      const last = next.length - 1;             // 마지막 = 진행 중 assistant
+      switch (evt.type) {
+        case "token":                            // 일반 답변: 조각 누적
+          next[last] = { role: "assistant", content: next[last].content + evt.content };
+          break;
+        case "message":                          // RAG 답변: 완성본 1회 교체
+          next[last] = { role: "assistant", content: evt.response };
+          break;
+        case "error":
+          next[last] = { role: "assistant", content: `⚠️ 오류: ${evt.detail}` };
+          break;
+        // blocked / confirmation_required → Phase 3에서 처리
+      }
+      return next;
+    });
+    if (evt.type === "done" || evt.type === "error") setStreaming(false);
+  });
 }
 ```
-> props(`from`, `onSubmit`, `status` 등)는 각 `.tsx` 파일에서 실제 시그니처를 확인 후 채우세요.
+
+### ⚠️ `token`(누적) vs `message`(교체)
+- `token`은 **조각**입니다 → `content + evt.content`로 **이어 붙입니다.**
+- `message`는 **완성본**입니다(RAG 검사본) → 통째로 **교체**합니다. 누적하면 안 됩니다.
+
+### 학습 질문
+- [ ] 빈 assistant 메시지를 미리 넣어두는 이유는? (힌트: 누적할 자리)
+- [ ] `message`를 누적(append)하면 어떤 버그가 생기나?
 
 ---
 
-## Step 4: 메시지 파트 렌더링 (5분)
+## Step 3: UI 컴포넌트 (plain) (10분)
 
-v6 `UIMessage`는 `content` 문자열이 아니라 **`parts` 배열**입니다.
-```ts
-message.parts.forEach((part) => {
-  if (part.type === "text") { /* MessageResponse로 렌더 */ }
-  // Phase 3: part.type === "data-blocked" / "data-confirmation" 처리
-});
-```
-- 일반 답변은 `text` 파트만 신경 쓰면 됩니다.
-- `data-*` 파트(차단/환불확인) 처리는 **Phase 3**에서.
+- **말풍선**: `messages.map(...)`으로 그리되 `role`에 따라 정렬/배경색을 다르게.
+  shadcn 카드/유틸 + Tailwind(`justify-end`, `bg-primary/10` 등)로 충분합니다.
+- **입력창**: shadcn `Input` + `Button`. `streaming`이면 버튼 비활성화.
+- **스트리밍 표시**: 진행 중 assistant 말풍선 끝에 점멸 커서나 작은 spinner.
+- **마크다운**(선택): 답변에 목록/코드가 많으면 `react-markdown` 같은 **경량 라이브러리만** 추가.
+
+> `frontend/AGENTS.md` 주의: 이 Next는 익숙한 Next가 아닐 수 있으니, 클라이언트 컴포넌트 규칙 등은
+> 코드 작성 전 `node_modules/next/dist/docs/`의 해당 가이드를 먼저 확인.
 
 ---
 
 ## 검증
 
-- [ ] 일반 질문 입력 → 토큰이 한 글자씩 실시간으로 누적 렌더된다.
-- [ ] 전송 중 `status`가 바뀌고 로딩 표시(Shimmer 등)가 보인다.
-- [ ] 같은 `thread_id`로 새로고침 후에도 대화 맥락이 이어진다(단기 기억 — 백엔드 InMemorySaver와 연결).
-- [ ] `npm run build`가 통과한다(선결 과제 해결 확인).
+- [ ] 일반 질문 → 토큰이 한 글자씩 실시간 누적 렌더.
+- [ ] 문서 기반 질문(RAG) → 완성본이 한 번에 뜸(토큰 흐름 없이).
+- [ ] 전송 중 버튼 비활성화 + 스트리밍 표시.
+- [ ] 같은 `thread_id` 유지 시 후속 질문에 맥락이 이어짐(단기 기억).
 
----
-
-## 검증 체크리스트 (개념)
-- [ ] v6 `useChat`이 `input`/`handleSubmit`이 아니라 `sendMessage`/`status`를 준다는 걸 안다.
-- [ ] `prepareSendMessagesRequest`로 바디를 백엔드 스키마에 맞추는 이유를 안다.
-- [ ] `UIMessage.parts` 배열 구조를 이해한다.
-- [ ] AI Elements가 코드로 설치되어 `.tsx`를 직접 봐야 정확한 props를 안다는 걸 안다.
+## 검증 체크리스트 (개념 이해)
+- [ ] "이벤트 → setState → 리렌더" 흐름을 설명할 수 있다.
+- [ ] `token` 누적과 `message` 교체를 구분할 수 있다.
+- [ ] `thread_id`가 대화 맥락 유지의 키임을 안다.
 
 ---
 
 ## 커밋
+
 ```
-feat(frontend): streaming chat ui with usechat + ai elements
+feat(frontend): streaming chat ui consuming /chat/stream sse
 ```
 
 ## 다음 단계
-- **Phase 3**: `data-blocked`(차단)·`data-confirmation`(환불 본인확인) 파트를 UI에서 처리.
+- **Phase 3**: `blocked`(차단)·`confirmation_required`(환불 본인확인) 이벤트 처리.

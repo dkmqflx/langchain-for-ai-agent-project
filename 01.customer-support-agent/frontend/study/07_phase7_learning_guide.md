@@ -43,7 +43,7 @@
 
 - LangSmith 트레이스가 정상 기록되는지 확인(백엔드 연동).
 - 환경변수(`NEXT_PUBLIC_API_URL`)가 빌드/런타임에서 올바른지 확인.
-- `npm run build` 최종 통과(Phase 2 선결 과제가 잔존하지 않는지).
+- `npm run build` 최종 통과(Phase 0에서 AI Elements 제거로 빌드 블로커가 해소된 상태 유지).
 
 ---
 
